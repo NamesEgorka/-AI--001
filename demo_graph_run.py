@@ -18,9 +18,7 @@ import asyncio
 # зарегистрировать как разрешённые для (де)сериализации. Без этого шага
 # всё РАБОТАЕТ (просто ругается warning'ом) — но в будущих версиях
 # LangGraph это станет жёсткой ошибкой, поэтому регистрируем сразу.
-from langgraph.checkpoint.serde.jsonplus import _msgpack_ext_hook_to_msgpack  # noqa: F401
 from langgraph.types import Command
-
 from orchestrator.core import Orchestrator
 from orchestrator.graph import build_graph
 from orchestrator.state import DialogueState, SearchResultSnapshot

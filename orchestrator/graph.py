@@ -18,9 +18,9 @@ from __future__ import annotations
 from typing import Any, Optional, TypedDict
 
 from langgraph.checkpoint.memory import MemorySaver
+from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command, interrupt
-
 from .core import Orchestrator
 from .state import DialogueState
 
@@ -182,5 +182,11 @@ def build_graph(orchestrator: Orchestrator):
     # Он и даёт нам interrupt()/resume работать, а заодно — персистентную
     # память диалога между вызовами по thread_id (в проде — Postgres/Redis
     # checkpointer вместо MemorySaver, интерфейс тот же).
-    checkpointer = MemorySaver()
+    serde = JsonPlusSerializer(
+    allowed_msgpack_modules=[
+        ("orchestrator.state", "DialogueState"),
+        ("orchestrator.state", "SearchResultSnapshot"),
+    ]
+)
+checkpointer = MemorySaver(serde=serde)
     return graph.compile(checkpointer=checkpointer)
