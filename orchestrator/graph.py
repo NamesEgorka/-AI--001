@@ -1,3 +1,4 @@
+cat > orchestrator/graph.py << 'PYEOF'
 """
 Первая версия настоящего LangGraph StateGraph поверх уже готового
 Orchestrator'а (orchestrator/core.py). Ничего из бизнес-логики не
@@ -21,6 +22,7 @@ from langgraph.checkpoint.memory import MemorySaver
 from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command, interrupt
+
 from .core import Orchestrator
 from .state import DialogueState
 
@@ -179,14 +181,20 @@ def build_graph(orchestrator: Orchestrator):
     graph.add_edge("create_order", END)
 
     # MemorySaver — простейший checkpointer (состояние в памяти процесса).
+    # Наши DialogueState/SearchResultSnapshot — обычные @dataclass, не
+    # входящие в стандартный набор типов LangGraph "из коробки", поэтому
+    # явно регистрируем их как разрешённые для (де)сериализации через
+    # официальный публичный параметр (а не через приватные функции модуля,
+    # имена которых меняются между версиями библиотеки).
+    serde = JsonPlusSerializer(
+        allowed_msgpack_modules=[
+            ("orchestrator.state", "DialogueState"),
+            ("orchestrator.state", "SearchResultSnapshot"),
+        ]
+    )
+    checkpointer = MemorySaver(serde=serde)
     # Он и даёт нам interrupt()/resume работать, а заодно — персистентную
     # память диалога между вызовами по thread_id (в проде — Postgres/Redis
     # checkpointer вместо MemorySaver, интерфейс тот же).
-    serde = JsonPlusSerializer(
-    allowed_msgpack_modules=[
-        ("orchestrator.state", "DialogueState"),
-        ("orchestrator.state", "SearchResultSnapshot"),
-    ]
-)
-checkpointer = MemorySaver(serde=serde)
     return graph.compile(checkpointer=checkpointer)
+PYEOF

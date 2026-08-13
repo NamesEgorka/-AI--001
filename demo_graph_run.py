@@ -1,3 +1,4 @@
+cat > demo_graph_run.py << 'PYEOF'
 """
 Демонстрация: запускаем граф, видим, как он останавливается на
 interrupt() перед созданием заказа, затем "отвечаем" за пользователя
@@ -11,14 +12,12 @@ from __future__ import annotations
 
 import asyncio
 
-# MemorySaver сериализует state между шагами через msgpack, чтобы работать
-# одинаково что с in-memory checkpointer'ом, что с Postgres/Redis в проде.
-# Наши DialogueState/SearchResultSnapshot — обычные @dataclass, не входящие
-# в стандартный набор типов LangGraph "из коробки", поэтому их нужно явно
-# зарегистрировать как разрешённые для (де)сериализации. Без этого шага
-# всё РАБОТАЕТ (просто ругается warning'ом) — но в будущих версиях
-# LangGraph это станет жёсткой ошибкой, поэтому регистрируем сразу.
+# Примечание: DialogueState — обычный @dataclass, целиком кладётся в один
+# канал GraphState.dialogue_state (см. orchestrator/graph.py). MemorySaver
+# сериализует его через встроенный jsonplus-сериализатор без дополнительной
+# регистрации — специального импорта приватных функций library не требуется.
 from langgraph.types import Command
+
 from orchestrator.core import Orchestrator
 from orchestrator.graph import build_graph
 from orchestrator.state import DialogueState, SearchResultSnapshot
@@ -74,3 +73,4 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
+PYEOF
