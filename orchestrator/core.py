@@ -172,3 +172,24 @@ class Orchestrator:
         assert_valid_transition(state.current_state, "order_confirmed")
         state.transition("order_confirmed")
         return result
+
+    # --- CheckOrderStatus ---------------------------------------------------
+
+    async def check_order_status(self, state: DialogueState, *, order_id: str) -> dict[str, Any]:
+        """
+        Самый простой intent из Intent Map: один синхронный вызов внутреннего
+        API, без цепочки guardrail-проверок (тут нечего "придумать" — либо
+        API вернул статус, либо нет).
+        """
+        assert_valid_transition(state.current_state, "status_check")
+        state.transition("status_check")
+
+        turn_id = state.new_turn_id()
+        status = await self.internal_api.get_order_status(
+            trace_id=state.trace_id, turn_id=turn_id, session_id=state.session_id,
+            order_id=order_id,
+        )
+
+        assert_valid_transition(state.current_state, "idle")
+        state.transition("idle")
+        return status

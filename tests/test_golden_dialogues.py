@@ -48,6 +48,9 @@ class FakeInternalApiClient:
     async def get_approval_requirements(self, *, trace_id, turn_id, session_id, order_draft):
         return {"required": self.approval_required, "_tool_source": "get_approval_requirements"}
 
+    async def get_order_status(self, *, trace_id, turn_id, session_id, order_id):
+        return {"order_id": order_id, "status": "confirmed", "_tool_source": "get_order_status"}
+
     async def create_order(self, *, trace_id, turn_id, session_id, order_draft, idempotency_key):
         if self.create_order_should_fail:
             raise RuntimeError("Внутренний Order API вернул 500 (симуляция сбоя)")
@@ -145,3 +148,22 @@ async def test_approval_required_blocks_immediate_order_creation():
     with pytest.raises(GuardrailViolation):
         await orch.create_order(state, user_confirmed=True)
     assert state.current_state == "approval_pending"
+
+
+@pytest.mark.asyncio
+async def test_check_order_status_returns_to_idle():
+    """
+    Golden-сценарий для CheckOrderStatus — самого простого intent'а:
+    вызов API, возврат к idle, без цепочки guardrail-проверок.
+    """
+    orch = Orchestrator(
+        internal_api=FakeInternalApiClient(),
+        kiwi_client=FakeKiwiClient(),
+    )
+    state = DialogueState(session_id="s_test_5")
+
+    status = await orch.check_order_status(state, order_id="ord_123")
+
+    assert status["status"] == "confirmed"
+    assert status["_tool_source"] == "get_order_status"
+    assert state.current_state == "idle"

@@ -41,6 +41,7 @@ class GraphState(TypedDict):
     date_from: str
     passengers: int
     selected_option_id: Optional[str]
+    order_id_to_check: Optional[str]
     user_confirmed: Optional[bool]
     final_result: Optional[dict[str, Any]]
     error: Optional[str]
@@ -126,12 +127,24 @@ def make_nodes(orchestrator: Orchestrator):
             return {"error": f"Не удалось создать заказ: {exc}"}
         return {"dialogue_state": ds, "final_result": result}
 
+    async def node_check_order_status(state: GraphState) -> dict[str, Any]:
+        ds: DialogueState = state["dialogue_state"]
+        order_id = state.get("order_id_to_check")
+        if not order_id:
+            return {"error": "order_id не указан для проверки статуса."}
+        try:
+            status = await orchestrator.check_order_status(ds, order_id=order_id)
+        except Exception as exc:  # noqa: BLE001
+            return {"error": f"Не удалось получить статус заказа: {exc}"}
+        return {"dialogue_state": ds, "final_result": status}
+
     return {
         "search_flights": node_search_flights,
         "select_option": node_select_option,
         "check_policy": node_check_policy,
         "await_user_confirmation": node_await_user_confirmation,
         "create_order": node_create_order,
+        "check_order_status": node_check_order_status,
     }
 
 
@@ -166,6 +179,16 @@ def route_after_confirmation(state: GraphState) -> str:
 
 
 def build_graph(orchestrator: Orchestrator):
+    """
+    ВАЖНО: этот граф описывает ОДИН линейный поток — SearchFlight -> ... ->
+    CreateOrder. Нода check_order_status уже реализована (см. make_nodes)
+    и покрыта тестом на уровне Orchestrator'а, но НЕ подключена рёбрами
+    здесь: CheckOrderStatus — независимый intent, а не шаг внутри сценария
+    бронирования. Чтобы агент реально мог выбирать между intent'ами
+    (а не всегда идти search_flights -> ... -> create_order), нужен
+    отдельный router-узел на входе, который решает, В КАКОЙ подграф идти,
+    на основе результата NLU. Это следующий шаг — см. README.md.
+    """
     nodes = make_nodes(orchestrator)
 
     graph = StateGraph(GraphState)
