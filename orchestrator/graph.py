@@ -1,4 +1,3 @@
-cat > orchestrator/graph.py << 'PYEOF'
 """
 Первая версия настоящего LangGraph StateGraph поверх уже готового
 Orchestrator'а (orchestrator/core.py). Ничего из бизнес-логики не
@@ -197,4 +196,3 @@ def build_graph(orchestrator: Orchestrator):
     # память диалога между вызовами по thread_id (в проде — Postgres/Redis
     # checkpointer вместо MemorySaver, интерфейс тот же).
     return graph.compile(checkpointer=checkpointer)
-PYEOF
