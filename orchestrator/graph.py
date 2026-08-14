@@ -42,6 +42,7 @@ class GraphState(TypedDict):
     passengers: int
     selected_option_id: Optional[str]
     order_id_to_check: Optional[str]
+    order_id_to_cancel: Optional[str]
     user_confirmed: Optional[bool]
     final_result: Optional[dict[str, Any]]
     error: Optional[str]
@@ -138,6 +139,19 @@ def make_nodes(orchestrator: Orchestrator):
             return {"error": f"Не удалось получить статус заказа: {exc}"}
         return {"dialogue_state": ds, "final_result": status}
 
+    async def node_cancel_order(state: GraphState) -> dict[str, Any]:
+        ds: DialogueState = state["dialogue_state"]
+        order_id = state.get("order_id_to_cancel")
+        if not order_id:
+            return {"error": "order_id не указан для отмены."}
+        try:
+            result = await orchestrator.cancel_order(
+                ds, order_id=order_id, user_confirmed=state.get("user_confirmed", False)
+            )
+        except Exception as exc:  # noqa: BLE001 — guardrail-блок (нет подтверждения) тоже сюда
+            return {"error": f"Не удалось отменить заказ: {exc}"}
+        return {"dialogue_state": ds, "final_result": result}
+
     return {
         "search_flights": node_search_flights,
         "select_option": node_select_option,
@@ -145,6 +159,7 @@ def make_nodes(orchestrator: Orchestrator):
         "await_user_confirmation": node_await_user_confirmation,
         "create_order": node_create_order,
         "check_order_status": node_check_order_status,
+        "cancel_order": node_cancel_order,
     }
 
 
@@ -181,13 +196,13 @@ def route_after_confirmation(state: GraphState) -> str:
 def build_graph(orchestrator: Orchestrator):
     """
     ВАЖНО: этот граф описывает ОДИН линейный поток — SearchFlight -> ... ->
-    CreateOrder. Нода check_order_status уже реализована (см. make_nodes)
-    и покрыта тестом на уровне Orchestrator'а, но НЕ подключена рёбрами
-    здесь: CheckOrderStatus — независимый intent, а не шаг внутри сценария
-    бронирования. Чтобы агент реально мог выбирать между intent'ами
-    (а не всегда идти search_flights -> ... -> create_order), нужен
-    отдельный router-узел на входе, который решает, В КАКОЙ подграф идти,
-    на основе результата NLU. Это следующий шаг — см. README.md.
+    CreateOrder. Ноды check_order_status и cancel_order уже реализованы
+    (см. make_nodes) и покрыты тестами на уровне Orchestrator'а, но НЕ
+    подключены рёбрами здесь: это независимые intent'ы, а не шаги внутри
+    сценария бронирования. Чтобы агент реально мог выбирать между
+    intent'ами (а не всегда идти search_flights -> ... -> create_order),
+    нужен отдельный router-узел на входе, который решает, В КАКОЙ подграф
+    идти, на основе результата NLU. Это следующий шаг — см. README.md.
     """
     nodes = make_nodes(orchestrator)
 

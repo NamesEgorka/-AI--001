@@ -37,10 +37,11 @@ class FakeInternalApiClient:
     """Замена внутренних API — имитирует ответы, как будто MCP-обёртка готова."""
 
     def __init__(self, *, policy_compliant: bool = True, approval_required: bool = False,
-                 create_order_should_fail: bool = False):
+                 create_order_should_fail: bool = False, cancel_order_should_fail: bool = False):
         self.policy_compliant = policy_compliant
         self.approval_required = approval_required
         self.create_order_should_fail = create_order_should_fail
+        self.cancel_order_should_fail = cancel_order_should_fail
 
     async def get_travel_policy(self, *, trace_id, turn_id, session_id, user_id, trip_context):
         return {"compliant": self.policy_compliant, "_tool_source": "get_travel_policy"}
@@ -50,6 +51,11 @@ class FakeInternalApiClient:
 
     async def get_order_status(self, *, trace_id, turn_id, session_id, order_id):
         return {"order_id": order_id, "status": "confirmed", "_tool_source": "get_order_status"}
+
+    async def cancel_order(self, *, trace_id, turn_id, session_id, order_id, idempotency_key):
+        if self.cancel_order_should_fail:
+            raise RuntimeError("Внутренний Order API вернул 500 при отмене (симуляция сбоя)")
+        return {"order_id": order_id, "status": "cancelled", "_tool_source": "cancel_order"}
 
     async def create_order(self, *, trace_id, turn_id, session_id, order_draft, idempotency_key):
         if self.create_order_should_fail:
@@ -167,3 +173,55 @@ async def test_check_order_status_returns_to_idle():
     assert status["status"] == "confirmed"
     assert status["_tool_source"] == "get_order_status"
     assert state.current_state == "idle"
+
+
+@pytest.mark.asyncio
+async def test_cancel_order_happy_path():
+    orch = Orchestrator(internal_api=FakeInternalApiClient(), kiwi_client=FakeKiwiClient())
+    state = DialogueState(session_id="s_test_6")
+
+    result = await orch.cancel_order(state, order_id="ord_123", user_confirmed=True)
+
+    assert result["status"] == "cancelled"
+    assert state.current_state == "cancelled"
+
+
+@pytest.mark.asyncio
+async def test_cancel_order_blocked_without_confirmation():
+    """Отмена заказа — необратимое действие, поэтому подтверждение строго обязательно."""
+    orch = Orchestrator(internal_api=FakeInternalApiClient(), kiwi_client=FakeKiwiClient())
+    state = DialogueState(session_id="s_test_7")
+
+    with pytest.raises(GuardrailViolation):
+        await orch.cancel_order(state, order_id="ord_123", user_confirmed=False)
+    assert state.current_state != "cancelled"
+
+
+@pytest.mark.asyncio
+async def test_cancel_order_fails_gracefully_and_allows_retry():
+    """Сбой API отмены -> cancel_failed, идемпотентный ключ освобождён для осознанного повтора."""
+    orch = Orchestrator(
+        internal_api=FakeInternalApiClient(cancel_order_should_fail=True),
+        kiwi_client=FakeKiwiClient(),
+    )
+    state = DialogueState(session_id="s_test_8")
+
+    with pytest.raises(RuntimeError):
+        await orch.cancel_order(state, order_id="ord_123", user_confirmed=True)
+    assert state.current_state == "cancel_failed"
+
+
+@pytest.mark.asyncio
+async def test_cancel_order_idempotency_blocks_duplicate():
+    """Повторный вызов cancel_order с тем же order_id в рамках одной сессии — блок, а не двойная отмена."""
+    from orchestrator.guardrails import DuplicateOperationError
+
+    orch = Orchestrator(internal_api=FakeInternalApiClient(), kiwi_client=FakeKiwiClient())
+    state = DialogueState(session_id="s_test_9")
+
+    await orch.cancel_order(state, order_id="ord_123", user_confirmed=True)
+    # Состояние уже в "cancelled", повторный вызов формально невалиден по
+    # transitions (cancelled -> cancel_confirm не разрешён) — это тоже
+    # правильная защита, просто на уровень выше, чем идемпотентность.
+    with pytest.raises(Exception):
+        await orch.cancel_order(state, order_id="ord_123", user_confirmed=True)

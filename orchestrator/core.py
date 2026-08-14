@@ -193,3 +193,90 @@ class Orchestrator:
         assert_valid_transition(state.current_state, "idle")
         state.transition("idle")
         return status
+
+    # --- CancelOrder (идемпотентность, как и CreateOrder) --------------------
+
+    async def cancel_order(
+        self, state: DialogueState, *, order_id: str, user_confirmed: bool
+    ) -> dict[str, Any]:
+        """
+        Как и CreateOrder — критичная операция с идемпотентностью, чтобы
+        повторный вызов (например, из-за сетевого retry) не попытался
+        отменить один и тот же заказ дважды. В отличие от CreateOrder,
+        здесь нет цепочки policy/approval — отмена не требует проверки
+        тревел-политики, только явное подтверждение пользователя.
+        """
+        if not user_confirmed:
+            raise GuardrailViolation(
+                "CancelOrder вызван без явного подтверждения пользователя — "
+                "заблокировано (см. Guardrails: критичные операции требуют "
+                "явного согласия, а не молчаливого допущения)."
+            )
+
+        assert_valid_transition(state.current_state, "cancel_confirm")
+        state.transition("cancel_confirm")
+
+        idempotency_key = self.idempotency_store.build_key(
+            session_id=state.session_id, operation="cancel_order",
+            payload={"order_id": order_id},
+        )
+        self.idempotency_store.check_and_reserve(idempotency_key)
+
+        turn_id = state.new_turn_id()
+        try:
+            result = await self.internal_api.cancel_order(
+                trace_id=state.trace_id, turn_id=turn_id, session_id=state.session_id,
+                order_id=order_id, idempotency_key=idempotency_key,
+            )
+        except Exception:
+            self.idempotency_store.mark_failed(idempotency_key)
+            assert_valid_transition(state.current_state, "cancel_failed")
+            state.transition("cancel_failed")
+            raise
+
+        self.idempotency_store.mark_completed(idempotency_key, result)
+        assert_valid_transition(state.current_state, "cancelled")
+        state.transition("cancelled")
+        return result
+
+    # --- CancelOrder (идемпотентность, как и CreateOrder) --------------------
+
+    async def cancel_order(
+        self, state: DialogueState, *, order_id: str, user_confirmed: bool
+    ) -> dict[str, Any]:
+        """
+        Зеркалит create_order: явное подтверждение обязательно (отмена
+        заказа — необратимое действие), идемпотентный ключ защищает от
+        двойной отмены при retry на сетевом сбое.
+        """
+        if not user_confirmed:
+            raise GuardrailViolation(
+                "CancelOrder вызван без явного подтверждения пользователя — "
+                "заблокировано."
+            )
+
+        assert_valid_transition(state.current_state, "cancel_confirm")
+        state.transition("cancel_confirm")
+
+        idempotency_key = self.idempotency_store.build_key(
+            session_id=state.session_id, operation="cancel_order",
+            payload={"order_id": order_id},
+        )
+        self.idempotency_store.check_and_reserve(idempotency_key)
+
+        turn_id = state.new_turn_id()
+        try:
+            result = await self.internal_api.cancel_order(
+                trace_id=state.trace_id, turn_id=turn_id, session_id=state.session_id,
+                order_id=order_id, idempotency_key=idempotency_key,
+            )
+        except Exception:
+            self.idempotency_store.mark_failed(idempotency_key)
+            assert_valid_transition(state.current_state, "cancel_failed")
+            state.transition("cancel_failed")
+            raise
+
+        self.idempotency_store.mark_completed(idempotency_key, result)
+        assert_valid_transition(state.current_state, "cancelled")
+        state.transition("cancelled")
+        return result

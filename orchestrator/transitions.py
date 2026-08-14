@@ -14,10 +14,11 @@ from __future__ import annotations
 from .state import DialogueStateName
 
 ALLOWED_TRANSITIONS: dict[DialogueStateName, set[DialogueStateName]] = {
-    # idle -> status_check разрешён напрямую: CheckOrderStatus — независимый
-    # intent (пользователь может спросить "что там с моим заказом от
-    # прошлой недели?" в любой момент, не только сразу после CreateOrder).
-    "idle": {"collecting_params", "searching", "status_check", "intent_switch_confirm"},
+    # idle -> status_check и idle -> cancel_confirm разрешены напрямую:
+    # оба CheckOrderStatus и CancelOrder — независимые intent'ы (можно
+    # спросить про/отменить заказ из прошлой сессии, не обязательно
+    # только что созданный в текущем диалоге).
+    "idle": {"collecting_params", "searching", "status_check", "cancel_confirm", "intent_switch_confirm"},
     "collecting_params": {"collecting_params", "searching", "intent_switch_confirm"},
     "searching": {"results_shown", "collecting_params"},  # collecting_params — если поиск вернул пусто и нужно уточнить
     "results_shown": {"policy_check", "collecting_params", "searching", "intent_switch_confirm"},
