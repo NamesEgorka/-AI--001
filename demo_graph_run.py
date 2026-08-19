@@ -36,20 +36,43 @@ async def main() -> None:
 
     thread_config = {"configurable": {"thread_id": "demo_session_1"}}
 
-    initial_input = {
+    search_input = {
         "dialogue_state": DialogueState(session_id="demo_session_1"),
+        # С шага 5 (router-узел на входе графа) точка входа больше не
+        # жёстко зашита в build_graph() — её явно указывает вызывающий
+        # код (в проде — api/main.py на основе orchestrator/router.py).
+        "intent_entry_node": "search_flights",
         "origin": "LAX",
         "destination": "JFK",
         "date_from": "2026-08-07",
         "passengers": 1,
-        "selected_option_id": "opt_1",
         "user_confirmed": None,
         "final_result": None,
         "error": None,
     }
 
-    print("--- Первый запуск: граф идёт до interrupt() и останавливается ---")
-    result = await app.ainvoke(initial_input, config=thread_config)
+    print("--- Ход 1: SearchFlight — граф показывает варианты и завершает ход ---")
+    # ВАЖНО: после исправления route_after_search (см. graph.py) поиск и
+    # выбор варианта — ДВА РАЗНЫХ хода диалога, ровно как по-настоящему
+    # происходит по HTTP (см. api/main.py, tests/test_api.py). Раньше
+    # здесь option_id передавался сразу вместе с поиском одним вызовом —
+    # это маскировало то, что пользователь физически не может знать
+    # option_id ДО того, как увидит результаты.
+    search_result = await app.ainvoke(search_input, config=thread_config)
+    if search_result.get("error"):
+        print("Ошибка поиска:", search_result["error"])
+        return
+    options = search_result["dialogue_state"].last_search_result.options
+    print(f"  Найдено вариантов: {len(options)}, первый: {options[0]}")
+
+    print("\n--- Ход 2: SelectOption — граф идёт до interrupt() и останавливается ---")
+    select_input = {
+        "intent_entry_node": "select_option",
+        "selected_option_id": options[0]["option_id"],
+        "error": None,
+        "final_result": None,
+    }
+    result = await app.ainvoke(select_input, config=thread_config)
 
     if "__interrupt__" in result:
         interrupt_payload = result["__interrupt__"][0].value
@@ -61,7 +84,7 @@ async def main() -> None:
         print("Граф завершился без остановки (ошибка или пустой результат):", result.get("error"))
         return
 
-    print("\n--- Пользователь отвечает 'да' ---")
+    print("\n--- Ход 3: пользователь отвечает 'да' ---")
     final_state = await app.ainvoke(Command(resume=True), config=thread_config)
 
     print("Итоговое состояние графа:")

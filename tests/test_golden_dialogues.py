@@ -33,6 +33,45 @@ class FakeKiwiClient:
         )
 
 
+class FakeHotelClient:
+    """
+    Замена реального TrivagoHotelClient — детерминированный ответ без сети.
+    Намеренно возвращает option_id в ТОМ ЖЕ формате, что и FakeKiwiClient,
+    чтобы продемонстрировать: select_option/check_policy/create_order не
+    видят разницы между доменами (см. комментарий в node_search_hotels).
+    """
+
+    async def search_hotels(self, *, trace_id, turn_id, session_id, destination,
+                             check_in, check_out, guests=1):
+        return SearchResultSnapshot(
+            search_id=f"trivago_{turn_id}",
+            intent="SearchHotel",
+            options=[
+                {"option_id": "hotel_opt_1", "name": "Hotel Divitis", "price_per_night": 137,
+                 "rating": 8.1, "_tool_source": "search_hotels"},
+            ],
+        )
+
+
+class FakeTrainClientForTest:
+    """
+    Замена FakeTrainClient (который сам уже заглушка) — здесь нужен ЕЩЁ
+    более простой, полностью фиксированный ответ для теста, без генерации
+    по хэшу, чтобы тест не зависел от деталей алгоритма генерации.
+    """
+
+    async def search_trains(self, *, trace_id, turn_id, session_id, origin,
+                             destination, date_from, passengers=1):
+        return SearchResultSnapshot(
+            search_id=f"faketrain_{turn_id}",
+            intent="SearchTrain",
+            options=[
+                {"option_id": "train_opt_1", "operator": "EuroRail", "price": 89,
+                 "seats_available": 4, "_tool_source": "search_trains_fake"},
+            ],
+        )
+
+
 class FakeInternalApiClient:
     """Замена внутренних API — имитирует ответы, как будто MCP-обёртка готова."""
 
@@ -225,3 +264,111 @@ async def test_cancel_order_idempotency_blocks_duplicate():
     # правильная защита, просто на уровень выше, чем идемпотентность.
     with pytest.raises(Exception):
         await orch.cancel_order(state, order_id="ord_123", user_confirmed=True)
+
+
+@pytest.mark.asyncio
+async def test_search_hotels_reuses_select_and_policy_and_order_nodes():
+    """
+    Ключевой тест для SearchHotel: демонстрирует, что select_option,
+    check_policy и create_order — ОДНИ И ТЕ ЖЕ методы Orchestrator'а,
+    что и для рейсов, без единой ветки if is_hotel/is_flight внутри них.
+    Единственное отличие — какой search-метод вызывается первым.
+    """
+    orch = Orchestrator(
+        internal_api=FakeInternalApiClient(policy_compliant=True, approval_required=False),
+        kiwi_client=FakeKiwiClient(),
+        hotel_client=FakeHotelClient(),
+    )
+    state = DialogueState(session_id="s_test_hotel_1")
+
+    state = await orch.search_hotels(
+        state, destination="Amsterdam", check_in="2026-03-20", check_out="2026-03-23",
+        guests=2,
+    )
+    assert state.current_state == "results_shown"
+    assert state.last_search_result.intent == "SearchHotel"
+
+    option = orch.select_option(state, option_id="hotel_opt_1")
+    assert option["name"] == "Hotel Divitis"
+
+    verdict = await orch.check_policy(state, user_id="u_1")
+    assert verdict["compliant"] is True
+
+    result = await orch.create_order(state, user_confirmed=True)
+    assert state.current_state == "order_confirmed"
+    assert result["order_id"] == "ord_123"
+
+
+@pytest.mark.asyncio
+async def test_search_hotels_empty_result_returns_to_collecting_params():
+    """Golden-сценарий: поиск отелей ничего не нашёл — не ошибка, а уточнение."""
+
+    class EmptyHotelClient:
+        async def search_hotels(self, **kwargs):
+            return SearchResultSnapshot(search_id="s_empty", intent="SearchHotel", options=[])
+
+    orch = Orchestrator(
+        internal_api=FakeInternalApiClient(),
+        kiwi_client=FakeKiwiClient(),
+        hotel_client=EmptyHotelClient(),
+    )
+    state = DialogueState(session_id="s_test_hotel_2")
+
+    state = await orch.search_hotels(
+        state, destination="Нигдевск", check_in="2026-03-20", check_out="2026-03-23",
+    )
+    assert state.current_state == "collecting_params"
+
+
+@pytest.mark.asyncio
+async def test_search_trains_reuses_select_and_policy_and_order_nodes():
+    """
+    Зеркало test_search_hotels_reuses_select_and_policy_and_order_nodes:
+    подтверждает, что select_option/check_policy/create_order работают
+    для SearchTrain БЕЗ ИЗМЕНЕНИЙ — источник данных (FakeTrainClientForTest)
+    единственное, что отличается от flight/hotel сценариев.
+    """
+    orch = Orchestrator(
+        internal_api=FakeInternalApiClient(policy_compliant=True, approval_required=False),
+        kiwi_client=FakeKiwiClient(),
+        train_client=FakeTrainClientForTest(),
+    )
+    state = DialogueState(session_id="s_test_train_1")
+
+    state = await orch.search_trains(
+        state, origin="Berlin", destination="Munich", date_from="2026-03-20",
+        passengers=1,
+    )
+    assert state.current_state == "results_shown"
+    assert state.last_search_result.intent == "SearchTrain"
+
+    option = orch.select_option(state, option_id="train_opt_1")
+    assert option["operator"] == "EuroRail"
+
+    verdict = await orch.check_policy(state, user_id="u_1")
+    assert verdict["compliant"] is True
+
+    result = await orch.create_order(state, user_confirmed=True)
+    assert state.current_state == "order_confirmed"
+    assert result["order_id"] == "ord_123"
+
+
+@pytest.mark.asyncio
+async def test_search_trains_empty_result_returns_to_collecting_params():
+    """Golden-сценарий: поиск жд-билетов ничего не нашёл — не ошибка, а уточнение."""
+
+    class EmptyTrainClient:
+        async def search_trains(self, **kwargs):
+            return SearchResultSnapshot(search_id="s_empty", intent="SearchTrain", options=[])
+
+    orch = Orchestrator(
+        internal_api=FakeInternalApiClient(),
+        kiwi_client=FakeKiwiClient(),
+        train_client=EmptyTrainClient(),
+    )
+    state = DialogueState(session_id="s_test_train_2")
+
+    state = await orch.search_trains(
+        state, origin="Нигдевск", destination="Никудаевск", date_from="2026-03-20",
+    )
+    assert state.current_state == "collecting_params"

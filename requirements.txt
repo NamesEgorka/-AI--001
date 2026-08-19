@@ -4,5 +4,5 @@ mcp>=1.0
 pytest>=8.0
 pytest-asyncio>=0.24
 langgraph>=0.2
-langgraph>=0.2
-langgraph>=0.2
+fastapi>=0.110
+uvicorn>=0.29

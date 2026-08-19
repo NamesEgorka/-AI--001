@@ -23,6 +23,7 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command, interrupt
 
 from .core import Orchestrator
+from .router import route_from_graph_state
 from .state import DialogueState
 
 # --- 1. State графа -----------------------------------------------------
@@ -36,10 +37,22 @@ from .state import DialogueState
 
 class GraphState(TypedDict):
     dialogue_state: DialogueState
+    # Куда войти в граф в этом ходу — считается router'ом (orchestrator/
+    # router.py) ДО вызова graph.ainvoke() и передаётся сюда одним полем,
+    # а не пересчитывается внутри графа (см. docstring route_from_graph_state).
+    intent_entry_node: Optional[str]
     origin: str
     destination: str
     date_from: str
     passengers: int
+    hotel_city: str
+    check_in: str
+    check_out: str
+    guests: int
+    train_origin: str
+    train_destination: str
+    train_date_from: str
+    train_passengers: int
     selected_option_id: Optional[str]
     order_id_to_check: Optional[str]
     order_id_to_cancel: Optional[str]
@@ -65,16 +78,68 @@ def make_nodes(orchestrator: Orchestrator):
 
     async def node_search_flights(state: GraphState) -> dict[str, Any]:
         ds: DialogueState = state["dialogue_state"]
+        # .get(...), а не state["origin"]: раньше эта нода вызывалась ТОЛЬКО
+        # как единственная точка входа графа (см. HANDOFF.md), поэтому все
+        # поля гарантированно приходили от demo_graph_run.py/тестов. Теперь,
+        # когда роутер может привести сюда трафик с любым набором полей
+        # (в норме — уже отфильтрованных router.route(), но defense in depth
+        # не помешает), прямая индексация упала бы KeyError вместо понятной
+        # ошибки пользователю.
+        origin, destination, date_from = state.get("origin"), state.get("destination"), state.get("date_from")
+        if not origin or not destination or not date_from:
+            return {"error": "Не хватает origin/destination/date_from для поиска рейсов."}
         try:
             ds = await orchestrator.search_flights(
-                ds,
-                origin=state["origin"],
-                destination=state["destination"],
-                date_from=state["date_from"],
+                ds, origin=origin, destination=destination, date_from=date_from,
                 passengers=state.get("passengers", 1),
             )
         except Exception as exc:  # noqa: BLE001
             return {"error": f"Ошибка поиска рейсов: {exc}"}
+        return {"dialogue_state": ds}
+
+    async def node_search_hotels(state: GraphState) -> dict[str, Any]:
+        """
+        Зеркало node_search_flights — тот же паттерн (вызвать метод
+        Orchestrator'а, обработать guardrail/сетевую ошибку), только
+        источник данных другой. Обратите внимание: select_option,
+        check_policy, await_user_confirmation и create_order ниже —
+        ТЕ ЖЕ САМЫЕ ноды, что и для рейсов, без единого изменения. Это
+        и есть выгода от единого SearchResultSnapshot формата: путь
+        "нашли варианты -> выбрали -> проверили политику -> подтвердили
+        -> создали заказ" не знает и не должен знать, рейс это или отель.
+        """
+        ds: DialogueState = state["dialogue_state"]
+        hotel_city, check_in, check_out = state.get("hotel_city"), state.get("check_in"), state.get("check_out")
+        if not hotel_city or not check_in or not check_out:
+            return {"error": "Не хватает hotel_city/check_in/check_out для поиска отелей."}
+        try:
+            ds = await orchestrator.search_hotels(
+                ds, destination=hotel_city, check_in=check_in, check_out=check_out,
+                guests=state.get("guests", 1),
+            )
+        except Exception as exc:  # noqa: BLE001
+            return {"error": f"Ошибка поиска отелей: {exc}"}
+        return {"dialogue_state": ds}
+
+    async def node_search_trains(state: GraphState) -> dict[str, Any]:
+        """
+        Третье зеркало node_search_flights/node_search_hotels — та же
+        нода select_option/check_policy/create_order ниже подходит и сюда
+        без изменений.
+        """
+        ds: DialogueState = state["dialogue_state"]
+        train_origin = state.get("train_origin")
+        train_destination = state.get("train_destination")
+        train_date_from = state.get("train_date_from")
+        if not train_origin or not train_destination or not train_date_from:
+            return {"error": "Не хватает train_origin/train_destination/train_date_from для поиска жд-билетов."}
+        try:
+            ds = await orchestrator.search_trains(
+                ds, origin=train_origin, destination=train_destination, date_from=train_date_from,
+                passengers=state.get("train_passengers", 1),
+            )
+        except Exception as exc:  # noqa: BLE001
+            return {"error": f"Ошибка поиска жд-билетов: {exc}"}
         return {"dialogue_state": ds}
 
     async def node_select_option(state: GraphState) -> dict[str, Any]:
@@ -152,14 +217,29 @@ def make_nodes(orchestrator: Orchestrator):
             return {"error": f"Не удалось отменить заказ: {exc}"}
         return {"dialogue_state": ds, "final_result": result}
 
+    async def node_unsupported_intent(state: GraphState) -> dict[str, Any]:
+        """
+        Точка приземления для intent'ов, у которых пока нет обработчика
+        (ExplainPolicy/SmallTalk/OutOfScope — см. router.py) или которые
+        router вообще не смог сопоставить ни одной ноде. НЕ должно
+        случаться при нормальной работе api/main.py (там router.route()
+        уже бросил бы RouterError раньше, до вызова графа) — это
+        последний рубеж на случай, если кто-то вызовет граф напрямую,
+        в обход роутера.
+        """
+        return {"error": f"Неподдержанный intent, нет обработчика в графе: {state.get('intent_entry_node')!r}."}
+
     return {
         "search_flights": node_search_flights,
+        "search_hotels": node_search_hotels,
+        "search_trains": node_search_trains,
         "select_option": node_select_option,
         "check_policy": node_check_policy,
         "await_user_confirmation": node_await_user_confirmation,
         "create_order": node_create_order,
         "check_order_status": node_check_order_status,
         "cancel_order": node_cancel_order,
+        "unsupported_intent": node_unsupported_intent,
     }
 
 
@@ -170,12 +250,20 @@ def make_nodes(orchestrator: Orchestrator):
 
 
 def route_after_search(state: GraphState) -> str:
-    if state.get("error"):
-        return END
-    ds: DialogueState = state["dialogue_state"]
-    if not ds.last_search_result or not ds.last_search_result.options:
-        return END  # в полной версии — нода "уточнить параметры", а не END
-    return "select_option"
+    """
+    С шага 5 (router на входе графа) SearchX и SelectOption — ДВА РАЗНЫХ
+    хода диалога (два отдельных HTTP-вызова /intent), а не одна цепочка
+    внутри одного graph.ainvoke(): пользователь ещё не мог выбрать
+    option_id в том же ходу, где эти варианты только что показаны.
+
+    Поэтому после успешного поиска граф ВСЕГДА завершает ход здесь (END),
+    вне зависимости от того, нашлись варианты или нет — отличие видно
+    по dialogue_state.current_state ("results_shown" vs "collecting_params",
+    см. Orchestrator.search_flights/search_hotels/search_trains). Следующий
+    ход — отдельный intent SelectOption через router (entry_node
+    "select_option", тот же session_id) — см. route().
+    """
+    return END
 
 
 def route_after_select(state: GraphState) -> str:
@@ -195,14 +283,25 @@ def route_after_confirmation(state: GraphState) -> str:
 
 def build_graph(orchestrator: Orchestrator):
     """
-    ВАЖНО: этот граф описывает ОДИН линейный поток — SearchFlight -> ... ->
-    CreateOrder. Ноды check_order_status и cancel_order уже реализованы
-    (см. make_nodes) и покрыты тестами на уровне Orchestrator'а, но НЕ
-    подключены рёбрами здесь: это независимые intent'ы, а не шаги внутри
-    сценария бронирования. Чтобы агент реально мог выбирать между
-    intent'ами (а не всегда идти search_flights -> ... -> create_order),
-    нужен отдельный router-узел на входе, который решает, В КАКОЙ подграф
-    идти, на основе результата NLU. Это следующий шаг — см. README.md.
+    Граф с router-узлом на входе (шаг 5 из HANDOFF.md): вместо одного
+    жёсткого пути START -> search_flights, START ветвится по
+    state["intent_entry_node"] (уже посчитанному router.route() ДО вызова
+    графа — см. api/main.py) в одну из пяти точек входа:
+
+        search_flights / search_hotels / search_trains
+            -> select_option -> check_policy -> await_user_confirmation
+            -> create_order (после resume)
+
+        select_option   — ВТОРОЙ ход в уже существующем thread_id (после
+                           того, как предыдущий SearchX-ход показал
+                           варианты) — продолжает по тому же пути выше.
+
+        check_order_status / cancel_order — самостоятельные короткие пути,
+                           сразу в END, без цепочки policy/approval.
+
+    unsupported_intent — честный тупик для intent'ов без обработчика
+    (см. node_unsupported_intent) — не должен случаться в норме, т.к.
+    router.route() отсекает такие intent'ы раньше, до вызова графа.
     """
     nodes = make_nodes(orchestrator)
 
@@ -210,12 +309,29 @@ def build_graph(orchestrator: Orchestrator):
     for name, fn in nodes.items():
         graph.add_node(name, fn)
 
-    graph.add_edge(START, "search_flights")
+    graph.add_conditional_edges(
+        START,
+        route_from_graph_state,
+        {
+            "search_flights": "search_flights",
+            "search_hotels": "search_hotels",
+            "search_trains": "search_trains",
+            "select_option": "select_option",
+            "check_order_status": "check_order_status",
+            "cancel_order": "cancel_order",
+            "unsupported_intent": "unsupported_intent",
+        },
+    )
     graph.add_conditional_edges("search_flights", route_after_search)
+    graph.add_conditional_edges("search_hotels", route_after_search)
+    graph.add_conditional_edges("search_trains", route_after_search)
     graph.add_conditional_edges("select_option", route_after_select)
     graph.add_conditional_edges("check_policy", route_after_policy)
     graph.add_conditional_edges("await_user_confirmation", route_after_confirmation)
     graph.add_edge("create_order", END)
+    graph.add_edge("check_order_status", END)
+    graph.add_edge("cancel_order", END)
+    graph.add_edge("unsupported_intent", END)
 
     # MemorySaver — простейший checkpointer (состояние в памяти процесса).
     # Наши DialogueState/SearchResultSnapshot — обычные @dataclass, не
