@@ -57,6 +57,12 @@ class Orchestrator:
         self, state: DialogueState, *, origin: str, destination: str, date_from: str,
         passengers: int = 1,
     ) -> DialogueState:
+        # active_intent — единственное место, откуда шаг 6 (nlu/service.py)
+        # берёт подсказку "какой intent сейчас активен в этом диалоге" для
+        # anaphora/intent_switch_detected. Раньше это поле объявлялось в
+        # DialogueState, но никогда не проставлялось нигде — обнаружено
+        # при написании тестов на POST /message.
+        state.active_intent = "SearchFlight"
         assert_valid_transition(state.current_state, "searching")
         state.transition("searching")
 
@@ -86,6 +92,7 @@ class Orchestrator:
         и отелей, потому что оба клиента возвращают SearchResultSnapshot
         одного и того же формата.
         """
+        state.active_intent = "SearchHotel"
         assert_valid_transition(state.current_state, "searching")
         state.transition("searching")
 
@@ -115,6 +122,7 @@ class Orchestrator:
         в отличие от Kiwi/trivago). Путь ниже (select_option/check_policy/
         create_order) не меняется ни на строчку — тот же SearchResultSnapshot.
         """
+        state.active_intent = "SearchTrain"
         assert_valid_transition(state.current_state, "searching")
         state.transition("searching")
 
@@ -235,6 +243,7 @@ class Orchestrator:
         self.idempotency_store.mark_completed(idempotency_key, result)
         assert_valid_transition(state.current_state, "order_confirmed")
         state.transition("order_confirmed")
+        state.active_intent = None  # флоу успешно завершён, подсказка больше не нужна
         return result
 
     # --- CheckOrderStatus ---------------------------------------------------
@@ -245,6 +254,7 @@ class Orchestrator:
         API, без цепочки guardrail-проверок (тут нечего "придумать" — либо
         API вернул статус, либо нет).
         """
+        state.active_intent = "CheckOrderStatus"
         assert_valid_transition(state.current_state, "status_check")
         state.transition("status_check")
 
@@ -256,6 +266,12 @@ class Orchestrator:
 
         assert_valid_transition(state.current_state, "idle")
         state.transition("idle")
+        # Короткий самостоятельный intent, полностью завершился за один
+        # ход — сбрасываем active_intent, чтобы следующая реплика в этой
+        # же сессии не получила ложную подсказку "мы всё ещё внутри
+        # CheckOrderStatus" (см. nlu/service.py: active_intent используется
+        # LLM как system-подсказка, устаревшая подсказка хуже отсутствующей).
+        state.active_intent = None
         return status
 
     # --- CancelOrder (идемпотентность, как и CreateOrder) --------------------
@@ -270,6 +286,7 @@ class Orchestrator:
         здесь нет цепочки policy/approval — отмена не требует проверки
         тревел-политики, только явное подтверждение пользователя.
         """
+        state.active_intent = "CancelOrder"
         if not user_confirmed:
             raise GuardrailViolation(
                 "CancelOrder вызван без явного подтверждения пользователя — "
@@ -300,4 +317,5 @@ class Orchestrator:
         self.idempotency_store.mark_completed(idempotency_key, result)
         assert_valid_transition(state.current_state, "cancelled")
         state.transition("cancelled")
+        state.active_intent = None  # флоу успешно завершён, подсказка больше не нужна
         return result

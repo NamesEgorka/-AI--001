@@ -96,15 +96,49 @@ vs `hotel_city` — намеренно не смешаны). `orchestrator/graph
 3. ~~SearchHotel~~ ✅
 4. ~~SearchTrain~~ ✅
 5. ~~FastAPI-обёртка + intent-роутер~~ ✅
-6. **Известные упрощения шага 5, которые стоит закрыть дальше** (по
-   приоритету):
-   - `IntentTurnRequest.slots` — плоский `dict[str, str]`, а не полный
-     `NLUOutput` (без confidence/raw_span/anaphora) — см. docstring
-     `api/main.py`. Когда появится реальный NLU-вызов (LangChain +
-     `with_structured_output(NLUOutput)`, см. пример в `nlu_output.py`),
-     нужно решить: либо отдельный сервис/слой ДО этого API конвертирует
-     `NLUOutput` → `IntentTurnRequest`, либо `/intent` начинает принимать
-     `NLUOutput` целиком и сам проверяет `clarification_needed`.
+6. ~~Известные упрощения шага 5 / NLU-слой~~ ✅ — реализовано как
+   `nlu/service.py` (`NLUService`, DI-паттерн как у `Orchestrator`,
+   `ChatAnthropic(...).with_structured_output(NLUExtraction)`) +
+   новый эндпоинт `POST /sessions/{id}/message` (сырой текст →
+   `NLUService.extract()` → либо `clarification` в ответе без захода в
+   граф, либо `NLUExtraction.entities` напрямую в уже существующий
+   `orchestrator/router.py:route()` — конвертация не нужна, тип тот же
+   `list[ExtractedEntity]`). `/intent` остался нетронутым для
+   ручных/скриптовых вызовов. Общее тело обоих эндпоинтов вынесено в
+   `_run_intent_turn()` (см. `api/main.py`).
+
+   Попутно найден и исправлен реальный баг: `DialogueState.active_intent`
+   был объявлен в `state.py`, но НИКОГДА не устанавливался ни в одном
+   методе `Orchestrator` — подсказка активного intent'а для NLU (нужна
+   для anaphora/"туда же", "на те же даты") была бы no-op. Исправлено:
+   `active_intent` теперь выставляется в начале `search_flights` /
+   `search_hotels` / `search_trains` / `check_order_status` /
+   `cancel_order` и сбрасывается в `None` на успешных терминальных
+   переходах (`order_confirmed`, `cancelled`, `idle` после
+   `CheckOrderStatus`) — но НЕ на `order_failed`/`cancel_failed`,
+   намеренно: пользователь может захотеть повторить попытку, и подсказка
+   там ещё уместна.
+
+   Тесты: `tests/test_nlu_service.py` (юнит, `FakeStructuredLLM`, без
+   реального Anthropic API) + `tests/test_api.py` (`/message`
+   end-to-end через тот же `FakeStructuredLLM`, включая проверку, что
+   `active_intent` реально доезжает до NLU через HTTP на втором ходу
+   одной и той же сессии).
+
+7. **Известные упрощения шага 6, которые стоит закрыть дальше:**
+   - `NLUService.extract()` принимает `history` явным списком сообщений,
+     но НИКТО пока не собирает эту историю из `DialogueState`/checkpointer'а
+     и не передаёт её в `/message` — сейчас anaphora-контекст ограничен
+     только `active_intent` (одна строка), полной истории реплик пока нет.
+   - Промпт (`nlu/service.py:SYSTEM_PROMPT`) не протестирован на реальных
+     ответах `ChatAnthropic` — только структура вызова (через
+     `FakeStructuredLLM`). Качество извлечения intent/entities на живых
+     репликах нужно проверить вручную с реальным `ANTHROPIC_API_KEY`
+     (в моей песочнице ключа нет, сеть на `api.anthropic.com` разрешена,
+     но без ключа реальный вызов не сделать).
+   - `intent_switch_detected` и `alternative_intents` из `NLUExtraction`
+     сейчас никак не используются в `api/main.py` — они долетают до
+     `NLUOutput`, но `_run_intent_turn` их просто игнорирует.
    - Нет эндпоинта "явно прервать/отменить ожидающий interrupt" — если
      `POST /confirm` не пришёл, сессия так и висит в
      `approval_pending`/паузе (не баг, а нереализованная часть; сейчас
@@ -130,6 +164,11 @@ vs `hotel_city` — намеренно не смешаны). `orchestrator/graph
 
 - GitHub Codespaces, репозиторий `NamesEgorka/-AI--001`, ветка `master`.
 - Зависимости: `pydantic`, `httpx`, `mcp`, `pytest`, `pytest-asyncio`,
-  `langgraph` (все уже в `requirements.txt`).
+  `langgraph`, `fastapi`, `uvicorn`, `langchain-anthropic` (все уже в
+  `requirements.txt`).
+- Для реального (не через FakeStructuredLLM) вызова `/message` нужен
+  `ANTHROPIC_API_KEY` в окружении Codespace — без него `NLUService()` по
+  умолчанию упадёт при первом обращении к `/message` (но НЕ при старте
+  приложения — см. ленивую инициализацию в `api/main.py:create_app`).
 - Запуск тестов: `PYTHONPATH=. pytest tests/ -v`
 - Запуск демо графа: `PYTHONPATH=. python3 demo_graph_run.py`

@@ -13,6 +13,8 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 
 from api.main import create_app
+from nlu.service import NLUService
+from nlu_output import ExtractedEntity, IntentPrediction, NLUExtraction
 from orchestrator.core import Orchestrator
 from tests.test_golden_dialogues import (
     FakeHotelClient,
@@ -20,16 +22,17 @@ from tests.test_golden_dialogues import (
     FakeKiwiClient,
     FakeTrainClientForTest,
 )
+from tests.test_nlu_service import FakeStructuredLLM
 
 
-def _make_client(**internal_api_kwargs) -> AsyncClient:
+def _make_client(nlu_service=None, **internal_api_kwargs) -> AsyncClient:
     orch = Orchestrator(
         internal_api=FakeInternalApiClient(**internal_api_kwargs),
         kiwi_client=FakeKiwiClient(),
         hotel_client=FakeHotelClient(),
         train_client=FakeTrainClientForTest(),
     )
-    app = create_app(orchestrator=orch)
+    app = create_app(orchestrator=orch, nlu_service=nlu_service)
     return AsyncClient(transport=ASGITransport(app=app), base_url="http://test")
 
 
@@ -181,3 +184,144 @@ async def test_state_endpoint_404_for_unknown_session():
     async with _make_client() as client:
         r = await client.get("/sessions/never_existed/state")
         assert r.status_code == 404
+
+
+# --- Шаг 6: POST /sessions/{id}/message (сырой текст -> NLU -> граф) --------
+#
+# Везде подставляем NLUService(llm=FakeStructuredLLM(...)) — ни один из
+# этих тестов не дёргает реальный Anthropic API (см. tests/test_nlu_service.py
+# про сам FakeStructuredLLM). Цель здесь — не переповторить test_nlu_service.py,
+# а доказать, что /message правильно СОЕДИНЯЕТ NLU-слой с уже
+# протестированным _run_intent_turn (тем же путём, что и /intent).
+
+def _flight_extraction() -> NLUExtraction:
+    return NLUExtraction(
+        raw_text="найди рейс из LAX в JFK на 7 августа",
+        intent=IntentPrediction(name="SearchFlight", confidence=0.95),
+        alternative_intents=[],
+        intent_switch_detected=False,
+        entities=[
+            ExtractedEntity(
+                slot_name="origin", value="LAX", raw_span="из LAX",
+                confidence=0.9, source="current_utterance",
+            ),
+            ExtractedEntity(
+                slot_name="destination", value="JFK", raw_span="в JFK",
+                confidence=0.9, source="current_utterance",
+            ),
+            ExtractedEntity(
+                slot_name="date_from", value="2026-08-07", raw_span="7 августа",
+                confidence=0.9, source="current_utterance",
+            ),
+        ],
+        missing_required_slots=[],
+        clarification_needed=False,
+        clarification_reason=None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_message_endpoint_routes_nlu_extraction_into_graph_same_as_intent():
+    fake_llm = FakeStructuredLLM(_flight_extraction())
+    nlu = NLUService(llm=fake_llm)
+
+    async with _make_client(
+        nlu_service=nlu, policy_compliant=True, approval_required=False,
+    ) as client:
+        r = await client.post(
+            "/sessions/http_message_1/message",
+            json={"raw_text": "найди рейс из LAX в JFK на 7 августа"},
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["current_state"] == "results_shown"
+        assert body["error"] is None
+        assert body["clarification"] is None
+
+
+@pytest.mark.asyncio
+async def test_message_endpoint_returns_clarification_without_touching_graph():
+    """
+    Если NLU-слой сам сказал clarification_needed=True — граф вообще не
+    должен вызываться (current_state остаётся 'idle', никакого захода в
+    orchestrator/router.py:route()).
+    """
+    ambiguous = NLUExtraction(
+        raw_text="хочу куда-нибудь улететь",
+        intent=IntentPrediction(name="SearchFlight", confidence=0.55),
+        alternative_intents=[],
+        intent_switch_detected=False,
+        entities=[],
+        missing_required_slots=["destination", "date_from"],
+        clarification_needed=True,
+        clarification_reason="missing_required_slot",
+    )
+    fake_llm = FakeStructuredLLM(ambiguous)
+    nlu = NLUService(llm=fake_llm)
+
+    async with _make_client(nlu_service=nlu) as client:
+        r = await client.post(
+            "/sessions/http_message_clarify_1/message",
+            json={"raw_text": "хочу куда-нибудь улететь"},
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["current_state"] == "idle"
+        assert body["error"] is None
+        assert body["clarification"]["reason"] == "missing_required_slot"
+        assert set(body["clarification"]["missing_slots"]) == {"destination", "date_from"}
+        assert body["clarification"]["detected_intent"] == "SearchFlight"
+
+
+@pytest.mark.asyncio
+async def test_message_endpoint_passes_active_intent_from_existing_session_state():
+    """
+    Второй ход в уже существующей сессии (после SearchFlight, показавшего
+    результаты) должен передать в NLU active_intent="SearchFlight" как
+    подсказку — сквозная проверка через ОДИН и тот же app/thread_id:
+    /intent (первый ход, NLU не нужен) -> /message (второй ход, тут уже
+    смотрим, что реально попало в messages, отправленные в FakeStructuredLLM).
+    """
+    captured_active_intent_hints: list[str] = []
+
+    def _responder(messages: list[dict]) -> NLUExtraction:
+        system_text = " ".join(m["content"] for m in messages if m["role"] == "system")
+        captured_active_intent_hints.append(system_text)
+        return NLUExtraction(
+            raw_text="выбери первый вариант",
+            intent=IntentPrediction(name="SelectOption", confidence=0.9),
+            alternative_intents=[],
+            intent_switch_detected=False,
+            entities=[
+                ExtractedEntity(
+                    slot_name="option_id", value="opt_1", raw_span="первый вариант",
+                    confidence=0.85, source="current_utterance",
+                )
+            ],
+            missing_required_slots=[],
+            clarification_needed=False,
+            clarification_reason=None,
+        )
+
+    nlu = NLUService(llm=FakeStructuredLLM(_responder))
+
+    async with _make_client(
+        nlu_service=nlu, policy_compliant=True, approval_required=False,
+    ) as client:
+        r1 = await client.post(
+            "/sessions/http_message_ctx_1/intent",
+            json={"intent": "SearchFlight", "slots": {
+                "origin": "LAX", "destination": "JFK", "date_from": "2026-08-07",
+            }},
+        )
+        assert r1.status_code == 200, r1.text
+
+        r2 = await client.post(
+            "/sessions/http_message_ctx_1/message",
+            json={"raw_text": "выбери первый вариант"},
+        )
+        assert r2.status_code == 200, r2.text
+        assert r2.json()["awaiting_confirmation"] is True
+
+    assert len(captured_active_intent_hints) == 1
+    assert "SearchFlight" in captured_active_intent_hints[0]

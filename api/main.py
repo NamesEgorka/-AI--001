@@ -28,6 +28,7 @@ from fastapi import FastAPI, HTTPException
 from langgraph.types import Command
 from pydantic import BaseModel, Field
 
+from nlu.service import NLUService
 from nlu_output import ExtractedEntity, IntentName
 from orchestrator.core import Orchestrator
 from orchestrator.graph import build_graph
@@ -49,8 +50,34 @@ class IntentTurnRequest(BaseModel):
     slots: dict[str, str] = Field(default_factory=dict)
 
 
+class MessageTurnRequest(BaseModel):
+    """
+    Шаг 6: сырая реплика пользователя — этот эндпоинт САМ вызывает
+    NLU-слой (см. nlu/service.py), в отличие от /intent, которому уже
+    нужен готовый intent+slots. Обе точки входа сходятся в одной и той
+    же функции _run_intent_turn() — разница только в том, ЧТО (человек
+    напрямую или NLU-слой) решает, какой это intent.
+    """
+
+    raw_text: str
+
+
 class ConfirmRequest(BaseModel):
     confirmed: bool
+
+
+class ClarificationInfo(BaseModel):
+    """
+    Заполняется ТОЛЬКО в ответ на /message, когда NLU-слой сам не уверен
+    (clarification_needed=True) — граф в этом случае вообще не вызывается,
+    это не ошибка выполнения (см. TurnResponse.error), а честный сигнал
+    "мне нужно больше информации от пользователя".
+    """
+
+    reason: str
+    missing_slots: list[str] = Field(default_factory=list)
+    detected_intent: Optional[str] = None
+    intent_confidence: Optional[float] = None
 
 
 class TurnResponse(BaseModel):
@@ -60,6 +87,7 @@ class TurnResponse(BaseModel):
     confirmation_question: Optional[dict[str, Any]] = None
     final_result: Optional[dict[str, Any]] = None
     error: Optional[str] = None
+    clarification: Optional[ClarificationInfo] = None
 
 
 class SessionStateResponse(BaseModel):
@@ -74,15 +102,34 @@ class SessionStateResponse(BaseModel):
 
 # --- Приложение --------------------------------------------------------------
 
-def create_app(orchestrator: Optional[Orchestrator] = None) -> FastAPI:
+def create_app(
+    orchestrator: Optional[Orchestrator] = None,
+    nlu_service: Optional[NLUService] = None,
+) -> FastAPI:
     """
     Фабрика приложения — принимает готовый Orchestrator, чтобы тесты могли
     подставить фейковые клиенты (см. tests/test_api.py), а прод — реальные
     (Kiwi/trivago/FakeTrainClient/InternalApiClient по умолчанию, как и в
-    Orchestrator()).
+    Orchestrator()). Аналогично nlu_service — тесты подставляют
+    NLUService(llm=FakeStructuredLLM(...)) (см. tests/test_api.py,
+    tests/test_nlu_service.py), прод — NLUService() без аргументов
+    (реальный ChatAnthropic, см. nlu/service.py).
     """
     orch = orchestrator or Orchestrator()
     graph = build_graph(orch)
+
+    # Ленивая инициализация NLUService: если задан явно (тесты) — берём
+    # его; иначе строим настоящий (ChatAnthropic) ТОЛЬКО при первом
+    # реальном обращении к /message, а не при создании app. Иначе любой
+    # тест/прогон, который вообще не трогает /message (например весь
+    # tests/test_api.py из шага 5), падал бы без ANTHROPIC_API_KEY уже на
+    # этапе create_app(), хотя ему LLM вообще не нужен.
+    _nlu_holder: dict[str, NLUService] = {}
+
+    def _get_nlu_service() -> NLUService:
+        if "instance" not in _nlu_holder:
+            _nlu_holder["instance"] = nlu_service or NLUService()
+        return _nlu_holder["instance"]
 
     app = FastAPI(
         title="Travel Agent Core API",
@@ -127,8 +174,15 @@ def create_app(orchestrator: Optional[Orchestrator] = None) -> FastAPI:
             error=result.get("error"),
         )
 
-    @app.post("/sessions/{session_id}/intent", response_model=TurnResponse)
-    async def post_intent(session_id: str, body: IntentTurnRequest) -> TurnResponse:
+    async def _run_intent_turn(
+        session_id: str, intent_name: str, entities: list[ExtractedEntity]
+    ) -> TurnResponse:
+        """
+        Общее тело для /intent и /message: обе точки входа в итоге сводятся
+        к одному и тому же — "вот intent, вот сущности, войди в граф".
+        Разница только в том, кто определил intent+entities: человек
+        напрямую (/intent) или NLU-слой по сырому тексту (/message).
+        """
         if await _has_pending_interrupt(session_id):
             # Явный, а не тихий конфликт: если граф стоит на паузе,
             # ждёт да/нет по уже начатому заказу, новый intent обязан
@@ -144,9 +198,8 @@ def create_app(orchestrator: Optional[Orchestrator] = None) -> FastAPI:
                 ),
             )
 
-        entities = _entities_from_slots(body.slots)
         try:
-            decision = route(body.intent, entities)
+            decision = route(intent_name, entities)
         except MissingRequiredSlotsError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         except UnsupportedIntentError as exc:
@@ -177,6 +230,63 @@ def create_app(orchestrator: Optional[Orchestrator] = None) -> FastAPI:
             raise HTTPException(status_code=500, detail=f"Внутренняя ошибка графа: {exc}") from exc
 
         return _response_from_result(session_id, result)
+
+    @app.post("/sessions/{session_id}/intent", response_model=TurnResponse)
+    async def post_intent(session_id: str, body: IntentTurnRequest) -> TurnResponse:
+        entities = _entities_from_slots(body.slots)
+        return await _run_intent_turn(session_id, body.intent, entities)
+
+    @app.post("/sessions/{session_id}/message", response_model=TurnResponse)
+    async def post_message(session_id: str, body: MessageTurnRequest) -> TurnResponse:
+        """
+        Шаг 6: сырая реплика → NLU-слой → (уточнение | intent+entities в
+        граф). Проверяем pending-interrupt ДО вызова NLU намеренно — нет
+        смысла тратить вызов LLM на реплику, если диалог всё равно ждёт
+        да/нет по уже начатому заказу через /confirm (тот же 409, что и
+        в _run_intent_turn, но раньше — там эта же проверка тоже есть,
+        дублирование осознанное и дешёвое, страховка на будущее).
+        """
+        if await _has_pending_interrupt(session_id):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Диалог стоит на паузе, ждёт подтверждения через "
+                    "POST /sessions/{session_id}/confirm — новую реплику "
+                    "сейчас принять нельзя."
+                ),
+            )
+
+        thread_config = _thread_config(session_id)
+        existing_state = await graph.aget_state(thread_config)
+        ds: Optional[DialogueState] = existing_state.values.get("dialogue_state")
+
+        try:
+            extraction = await _get_nlu_service().extract(
+                body.raw_text,
+                session_id=session_id,
+                active_intent=ds.active_intent if ds else None,
+            )
+        except Exception as exc:  # noqa: BLE001 — LLM/сеть недоступны и т.п.
+            raise HTTPException(
+                status_code=502, detail=f"NLU-слой не смог обработать реплику: {exc}"
+            ) from exc
+
+        if extraction.clarification_needed:
+            # Граф вообще не вызываем — NLU-слой сам сказал, что не хватает
+            # уверенности/слотов. Это НЕ ошибка (TurnResponse.error), а
+            # честный "нужно уточнение", см. ClarificationInfo.
+            return TurnResponse(
+                session_id=session_id,
+                current_state=ds.current_state if ds else "idle",
+                clarification=ClarificationInfo(
+                    reason=extraction.clarification_reason or "low_intent_confidence",
+                    missing_slots=extraction.missing_required_slots,
+                    detected_intent=extraction.intent.name,
+                    intent_confidence=extraction.intent.confidence,
+                ),
+            )
+
+        return await _run_intent_turn(session_id, extraction.intent.name, extraction.entities)
 
     @app.post("/sessions/{session_id}/confirm", response_model=TurnResponse)
     async def post_confirm(session_id: str, body: ConfirmRequest) -> TurnResponse:
