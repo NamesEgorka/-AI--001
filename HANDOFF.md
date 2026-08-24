@@ -97,8 +97,7 @@ vs `hotel_city` — намеренно не смешаны). `orchestrator/graph
 4. ~~SearchTrain~~ ✅
 5. ~~FastAPI-обёртка + intent-роутер~~ ✅
 6. ~~Известные упрощения шага 5 / NLU-слой~~ ✅ — реализовано как
-   `nlu/service.py` (`NLUService`, DI-паттерн как у `Orchestrator`,
-   `ChatAnthropic(...).with_structured_output(NLUExtraction)`) +
+   `nlu/service.py` (`NLUService`, DI-паттерн как у `Orchestrator`) +
    новый эндпоинт `POST /sessions/{id}/message` (сырой текст →
    `NLUService.extract()` → либо `clarification` в ответе без захода в
    граф, либо `NLUExtraction.entities` напрямую в уже существующий
@@ -106,6 +105,18 @@ vs `hotel_city` — намеренно не смешаны). `orchestrator/graph
    `list[ExtractedEntity]`). `/intent` остался нетронутым для
    ручных/скриптовых вызовов. Общее тело обоих эндпоинтов вынесено в
    `_run_intent_turn()` (см. `api/main.py`).
+
+   **LLM-провайдер сменён с Anthropic Claude на Google Gemini**
+   (`ChatGoogleGenerativeAI(...).with_structured_output(NLUExtraction)`,
+   модель по умолчанию `gemini-2.5-flash`) — `NLUService(provider=...)`
+   поддерживает оба ("google" по умолчанию, "anthropic" оставлен как
+   опция). Важное отличие, из-за которого чуть не сломался запуск:
+   в отличие от `ChatAnthropic`, конструктор `ChatGoogleGenerativeAI`
+   **проверяет наличие ключа сразу**, а не при первом вызове — поэтому
+   ленивая инициализация `NLUService` в `api/main.py` (строится только
+   при первом обращении к `/message`, не при старте приложения) здесь
+   не опциональное удобство, а обязательное условие, иначе
+   `uvicorn api.main:app` не поднимался бы вовсе без `GOOGLE_API_KEY`.
 
    Попутно найден и исправлен реальный баг: `DialogueState.active_intent`
    был объявлен в `state.py`, но НИКОГДА не устанавливался ни в одном
@@ -131,11 +142,12 @@ vs `hotel_city` — намеренно не смешаны). `orchestrator/graph
      и не передаёт её в `/message` — сейчас anaphora-контекст ограничен
      только `active_intent` (одна строка), полной истории реплик пока нет.
    - Промпт (`nlu/service.py:SYSTEM_PROMPT`) не протестирован на реальных
-     ответах `ChatAnthropic` — только структура вызова (через
-     `FakeStructuredLLM`). Качество извлечения intent/entities на живых
-     репликах нужно проверить вручную с реальным `ANTHROPIC_API_KEY`
-     (в моей песочнице ключа нет, сеть на `api.anthropic.com` разрешена,
-     но без ключа реальный вызов не сделать).
+     ответах LLM — только структура вызова (через `FakeStructuredLLM`).
+     Качество извлечения intent/entities на живых репликах нужно
+     проверить вручную с реальным `GOOGLE_API_KEY` (в моей песочнице
+     ключа нет; сеть на `generativelanguage.googleapis.com` в моём
+     network_configuration НЕ разрешена — я физически не могу сам
+     сделать живой вызов, только пользователь в своём Codespace).
    - `intent_switch_detected` и `alternative_intents` из `NLUExtraction`
      сейчас никак не используются в `api/main.py` — они долетают до
      `NLUOutput`, но `_run_intent_turn` их просто игнорирует.
@@ -164,11 +176,13 @@ vs `hotel_city` — намеренно не смешаны). `orchestrator/graph
 
 - GitHub Codespaces, репозиторий `NamesEgorka/-AI--001`, ветка `master`.
 - Зависимости: `pydantic`, `httpx`, `mcp`, `pytest`, `pytest-asyncio`,
-  `langgraph`, `fastapi`, `uvicorn`, `langchain-anthropic` (все уже в
+  `langgraph`, `fastapi`, `uvicorn`, `langchain-google-genai` (все уже в
   `requirements.txt`).
 - Для реального (не через FakeStructuredLLM) вызова `/message` нужен
-  `ANTHROPIC_API_KEY` в окружении Codespace — без него `NLUService()` по
-  умолчанию упадёт при первом обращении к `/message` (но НЕ при старте
-  приложения — см. ленивую инициализацию в `api/main.py:create_app`).
+  `GOOGLE_API_KEY` (или `GEMINI_API_KEY`) в окружении Codespace — без
+  него `NLUService()` по умолчанию упадёт при первом обращении к
+  `/message` (но НЕ при старте приложения — см. ленивую инициализацию
+  в `api/main.py:create_app`; см. также важное отличие от
+  `ChatAnthropic` в docstring `nlu/service.py`).
 - Запуск тестов: `PYTHONPATH=. pytest tests/ -v`
 - Запуск демо графа: `PYTHONPATH=. python3 demo_graph_run.py`

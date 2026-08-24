@@ -15,7 +15,7 @@ FastAPI-обёртка поверх графа (orchestrator/graph.py) — ша�
 не источник фактов"): этот слой НЕ вызывает LLM сам. Тело запроса на
 /intent — это уже посчитанный intent + слоты, то есть то, что в проде
 отдал бы NLU-слой (см. nlu_output.py, там же пример вызова
-ChatAnthropic.with_structured_output(NLUOutput)). Здесь эта граница
+<llm-провайдер, сейчас ChatGoogleGenerativeAI>.with_structured_output(NLUOutput)). Здесь эта граница
 проведена явно эндпоинтом: где заканчивается "понять, что хочет
 пользователь" и начинается "выполнить это по строгим правилам".
 """
@@ -113,16 +113,16 @@ def create_app(
     Orchestrator()). Аналогично nlu_service — тесты подставляют
     NLUService(llm=FakeStructuredLLM(...)) (см. tests/test_api.py,
     tests/test_nlu_service.py), прод — NLUService() без аргументов
-    (реальный ChatAnthropic, см. nlu/service.py).
+    (реальный ChatGoogleGenerativeAI, см. nlu/service.py).
     """
     orch = orchestrator or Orchestrator()
     graph = build_graph(orch)
 
     # Ленивая инициализация NLUService: если задан явно (тесты) — берём
-    # его; иначе строим настоящий (ChatAnthropic) ТОЛЬКО при первом
+    # его; иначе строим настоящий (ChatGoogleGenerativeAI) ТОЛЬКО при первом
     # реальном обращении к /message, а не при создании app. Иначе любой
     # тест/прогон, который вообще не трогает /message (например весь
-    # tests/test_api.py из шага 5), падал бы без ANTHROPIC_API_KEY уже на
+    # tests/test_api.py из шага 5), падал бы без GOOGLE_API_KEY уже на
     # этапе create_app(), хотя ему LLM вообще не нужен.
     _nlu_holder: dict[str, NLUService] = {}
 

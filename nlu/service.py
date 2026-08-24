@@ -15,12 +15,18 @@ NLUService — единственное место в проекте, где р�
 LLM подставляется через Dependency Injection (тот же паттерн, что у
 Orchestrator с internal_api/kiwi_client/train_client) — тесты
 (tests/test_nlu_service.py) подсовывают Fake-реализацию протокола
-StructuredLLMClient и НЕ дёргают реальный Anthropic API. Прод —
-create_app() создаёт NLUService() без аргументов, что лениво строит
-настоящий ChatAnthropic().with_structured_output(NLUExtraction)
-(см. api/main.py — конструирование отложено до первого /message,
-чтобы отсутствие ANTHROPIC_API_KEY не ломало приложение, если им никто
-не пользуется, например в тестах /intent).
+StructuredLLMClient и НЕ дёргают реальный LLM API. Прод — create_app()
+создаёт NLUService() без аргументов, что лениво строит настоящий
+ChatGoogleGenerativeAI(...).with_structured_output(NLUExtraction)
+(см. api/main.py — конструирование отложено до первого /message).
+
+ВАЖНО отличие от прошлой версии (Anthropic): у ChatGoogleGenerativeAI
+ключ (GOOGLE_API_KEY/GEMINI_API_KEY) проверяется СРАЗУ при конструировании
+объекта, а не при первом реальном вызове (ChatAnthropic был в этом
+смысле мягче). Поэтому ленивая инициализация в api/main.py (см.
+create_app: NLUService строится только при первом обращении к /message,
+а не при старте приложения) здесь даже более критична, чем раньше —
+без неё `uvicorn api.main:app` вообще не поднялся бы без ключа.
 """
 
 from __future__ import annotations
@@ -34,9 +40,12 @@ from orchestrator.router import INTENT_SPECS
 
 class StructuredLLMClient(Protocol):
     """
-    Протокол под `ChatAnthropic(...).with_structured_output(NLUExtraction)`
+    Протокол под `<любой langchain chat-model>.with_structured_output(NLUExtraction)`
     (langchain Runnable, у которого есть async .ainvoke(messages)).
-    Позволяет подставить фейк в тестах, не поднимая реальный LLM-вызов.
+    Позволяет подставить фейк в тестах, не поднимая реальный LLM-вызов —
+    и не завязывает NLUService на конкретного провайдера (см. _PROVIDER_BUILDERS
+    ниже: сейчас Google Gemini по умолчанию, раньше был Anthropic Claude,
+    смена — одна строка).
     """
 
     async def ainvoke(self, messages: list[dict[str, str]]) -> NLUExtraction: ...
@@ -89,24 +98,41 @@ ExplainPolicy, SmallTalk, OutOfScope.
 
 
 class NLUService:
+    """
+    provider — "google" (по умолчанию, Gemini) или "anthropic" (Claude,
+    оставлен как опция — например, если понадобится сравнить качество
+    извлечения между провайдерами на одном и том же SYSTEM_PROMPT).
+    """
+
     def __init__(
         self,
         llm: Optional[StructuredLLMClient] = None,
         *,
-        model: str = "claude-sonnet-5",
+        provider: str = "google",
+        model: Optional[str] = None,
     ) -> None:
-        self._llm = llm or self._build_default_llm(model)
+        self._llm = llm or self._build_default_llm(provider, model)
 
     @staticmethod
-    def _build_default_llm(model: str) -> StructuredLLMClient:
+    def _build_default_llm(provider: str, model: Optional[str]) -> StructuredLLMClient:
         # Импорт внутри метода, а не на верхнем уровне модуля — чтобы
         # nlu_output.py/router.py можно было использовать (и тестировать)
-        # без установленного langchain_anthropic, если LLM в конкретном
-        # прогоне вообще не нужен (см. tests/test_nlu_service.py — там
-        # всегда передаётся Fake, реальный импорт не срабатывает).
-        from langchain_anthropic import ChatAnthropic
+        # без установленного langchain_google_genai/langchain_anthropic,
+        # если реальный LLM в конкретном прогоне вообще не нужен (см.
+        # tests/test_nlu_service.py — там всегда передаётся Fake, реальный
+        # импорт ни одной из двух библиотек не срабатывает).
+        if provider == "google":
+            from langchain_google_genai import ChatGoogleGenerativeAI
 
-        base = ChatAnthropic(model=model)
+            base = ChatGoogleGenerativeAI(model=model or "gemini-2.5-flash")
+        elif provider == "anthropic":
+            from langchain_anthropic import ChatAnthropic
+
+            base = ChatAnthropic(model=model or "claude-sonnet-5")
+        else:
+            raise ValueError(
+                f"Неизвестный provider={provider!r} (ожидается 'google' или 'anthropic')"
+            )
         return base.with_structured_output(NLUExtraction)  # type: ignore[return-value]
 
     async def extract(
