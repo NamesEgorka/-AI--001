@@ -15,3 +15,6 @@ venv/
 
 # OS
 .DS_Store
+sessions.db
+sessions.db-shm
+sessions.db-wal

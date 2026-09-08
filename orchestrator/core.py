@@ -18,8 +18,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from tools.flight_api_adapter import FlightApiAdapter
 from tools.internal_api_client import InternalApiClient
-from tools.kiwi_client import KiwiFlightClient
 from tools.train_client import FakeTrainClient
 from tools.trivago_client import TrivagoHotelClient
 
@@ -40,13 +40,13 @@ class Orchestrator:
         self,
         *,
         internal_api: InternalApiClient | None = None,
-        kiwi_client: KiwiFlightClient | None = None,
+        kiwi_client: FlightApiAdapter | None = None,
         hotel_client: TrivagoHotelClient | None = None,
         train_client: FakeTrainClient | None = None,
         idempotency_store: IdempotencyStore | None = None,
     ) -> None:
         self.internal_api = internal_api or InternalApiClient()
-        self.kiwi_client = kiwi_client or KiwiFlightClient()
+        self.kiwi_client = kiwi_client or FlightApiAdapter()
         self.hotel_client = hotel_client or TrivagoHotelClient()
         self.train_client = train_client or FakeTrainClient()
         self.idempotency_store = idempotency_store or IdempotencyStore()

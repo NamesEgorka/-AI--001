@@ -102,6 +102,16 @@ class NLUService:
     provider — "google" (по умолчанию, Gemini) или "anthropic" (Claude,
     оставлен как опция — например, если понадобится сравнить качество
     извлечения между провайдерами на одном и том же SYSTEM_PROMPT).
+
+    model по умолчанию для "google" — "gemini-3.6-flash". Раньше тут
+    стоял "gemini-2.5-flash" — он перестал быть доступен новым
+    пользователям API (обнаружено при живом прогоне /message в чате:
+    404 NOT_FOUND, "models/gemini-2.5-flash is no longer available to
+    new users"). "gemini-3.6-flash" подтверждён как актуальная stable-
+    модель на момент этой правки (июль 2026); если к моменту, когда вы
+    это читаете, появилась более новая (например gemini-3.7-flash,
+    вышла 13 августа 2026) — переопределите явно через
+    NLUService(model="...").
     """
 
     def __init__(
@@ -124,7 +134,7 @@ class NLUService:
         if provider == "google":
             from langchain_google_genai import ChatGoogleGenerativeAI
 
-            base = ChatGoogleGenerativeAI(model=model or "gemini-2.5-flash")
+            base = ChatGoogleGenerativeAI(model=model or "gemini-3.6-flash")
         elif provider == "anthropic":
             from langchain_anthropic import ChatAnthropic
 

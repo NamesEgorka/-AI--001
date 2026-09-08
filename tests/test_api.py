@@ -36,6 +36,32 @@ def _make_client(nlu_service=None, **internal_api_kwargs) -> AsyncClient:
     return AsyncClient(transport=ASGITransport(app=app), base_url="http://test")
 
 
+def test_orchestrator_uses_flight_adapter_by_default():
+    orchestrator = Orchestrator()
+    assert orchestrator.kiwi_client.__class__.__name__ == "FlightApiAdapter"
+
+
+@pytest.mark.asyncio
+async def test_flight_api_adapter_parses_real_api_payload():
+    from tools.flight_api_adapter import FlightApiAdapter
+
+    adapter = FlightApiAdapter()
+    result = await adapter.search_flights(
+        trace_id="tr_1",
+        turn_id="t_1",
+        session_id="s_1",
+        origin="LAX",
+        destination="JFK",
+        date_from="2026-08-07",
+    )
+
+    assert result.intent == "SearchFlight"
+    assert result.options[0]["option_id"] == "flight_opt_0"
+    assert result.options[0]["carrier"] == "MVP Air"
+    assert result.options[0]["origin"] == "LAX"
+    assert result.options[0]["destination"] == "JFK"
+
+
 @pytest.mark.asyncio
 async def test_full_flight_flow_over_http():
     async with _make_client(policy_compliant=True, approval_required=False) as client:
@@ -49,6 +75,8 @@ async def test_full_flight_flow_over_http():
         body1 = r1.json()
         assert body1["current_state"] == "results_shown"
         assert body1["awaiting_confirmation"] is False
+        assert "1 вариант" in body1["message"]
+        assert "Выберите рейс: выбираю <ID>" in body1["message"]
         # Исправлено на шаге 5 (см. graph.py route_after_search): успешный
         # поиск — это ЧИСТЫЙ результат без error, ждём следующий ход
         # (SelectOption) отдельным вызовом /intent, а не то же graph.ainvoke.
@@ -177,6 +205,55 @@ async def test_new_intent_while_awaiting_confirmation_returns_409():
             }},
         )
         assert r_conflict.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_trivago_client_handles_streamable_http_2_tuple_transport(monkeypatch):
+    from tools.trivago_client import TrivagoHotelClient
+
+    class FakeSession:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def initialize(self):
+            return None
+
+        async def call_tool(self, tool_name, arguments):
+            assert tool_name == "search_hotels"
+            return type("Result", (), {"content": [{"data": {"name": "Hotel X", "price_per_night": 100}}]})()
+
+    class FakeTransportContext:
+        async def __aenter__(self):
+            return (object(), object())
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    from contextlib import asynccontextmanager
+
+    @asynccontextmanager
+    async def fake_streamable_http_client(url: str, **kwargs):
+        yield (object(), object())
+
+    monkeypatch.setattr("tools.trivago_client.streamable_http_client", fake_streamable_http_client)
+    monkeypatch.setattr("tools.trivago_client.ClientSession", lambda read, write: FakeSession())
+
+    client = TrivagoHotelClient(server_url="http://example.test")
+    result = await client.search_hotels(
+        trace_id="tr_1",
+        turn_id="t_1",
+        session_id="s_1",
+        destination="Paris",
+        check_in="2026-08-07",
+        check_out="2026-08-09",
+    )
+
+    assert result.intent == "SearchHotel"
+    assert result.options[0]["option_id"] == "trivago_opt_0"
+    assert result.options[0]["_tool_source"] == "search_hotels"
 
 
 @pytest.mark.asyncio

@@ -7,3 +7,4 @@ langgraph>=0.2
 fastapi>=0.110
 uvicorn>=0.29
 langchain-google-genai>=2.0
+langgraph-checkpoint-sqlite>=2.0

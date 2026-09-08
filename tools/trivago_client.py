@@ -67,7 +67,14 @@ class TrivagoHotelClient:
             tool_name=TRIVAGO_TOOL_NAME,
         ):
             try:
-                async with streamable_http_client(self.server_url) as (read, write, _):
+                async with streamable_http_client(self.server_url) as transport:
+                    if isinstance(transport, tuple):
+                        if len(transport) == 2:
+                            read, write = transport
+                        else:
+                            read, write, _ = transport
+                    else:
+                        read, write = transport
                     async with ClientSession(read, write) as session:
                         await session.initialize()
                         result = await session.call_tool(TRIVAGO_TOOL_NAME, arguments)

@@ -281,7 +281,7 @@ def route_after_confirmation(state: GraphState) -> str:
 # --- 4. Сборка графа ---------------------------------------------------------
 
 
-def build_graph(orchestrator: Orchestrator):
+def build_graph(orchestrator: Orchestrator, checkpointer=None):
     """
     Граф с router-узлом на входе (шаг 5 из HANDOFF.md): вместо одного
     жёсткого пути START -> search_flights, START ветвится по
@@ -345,7 +345,7 @@ def build_graph(orchestrator: Orchestrator):
             ("orchestrator.state", "SearchResultSnapshot"),
         ]
     )
-    checkpointer = MemorySaver(serde=serde)
+    checkpointer = checkpointer or MemorySaver(serde=serde)
     # Он и даёт нам interrupt()/resume работать, а заодно — персистентную
     # память диалога между вызовами по thread_id (в проде — Postgres/Redis
     # checkpointer вместо MemorySaver, интерфейс тот же).

@@ -1,188 +1,211 @@
-# HANDOFF — передача контекста для продолжения в новом чате
+# HANDOFF — AI-агент определения командировок
 
-Прикрепите этот файл (и, если нужно, весь `travel_agent_core.zip`) в начале
-нового диалога с Claude — этого достаточно, чтобы продолжить без повторных
-объяснений.
+Python + LangGraph + FastAPI. Тестовый/портфолио-проект — не подключён к
+реальным системам компании, использует честные локальные заглушки там,
+где нет доступа к реальным внешним API.
 
-## Контекст проекта
+## Статус: MVP готов и покрыт тестами (58/58)
 
-Вы готовитесь к вакансии AI Agent Engineer (компания разрабатывает
-корпоративный AI-агент поиска авиа/жд/отелей поверх существующей OBT —
-Online Booking Tool). Мы вместе строим Python + LangGraph реализацию как
-практику и как портфолио-артефакт для интервью.
+Полный цикл диалога работает end-to-end через HTTP: сырая реплика
+пользователя → NLU (Gemini) → граф (LangGraph) → guardrails → результат,
+с персистентностью между перезапусками сервера.
 
-Репозиторий уже выложен на GitHub: `github.com/NamesEgorka/-AI--001`
-(работа велась через GitHub Codespaces в браузере).
+---
 
-## Архитектурные принципы (не менять без явного решения)
+## Архитектура
 
-- LLM никогда не источник фактов — только оркестратор дальше решает вызвать
-  инструмент. Все цены/статусы/политика — только из tool result с меткой
-  `_tool_source`.
-- Guardrails реализованы в коде (`orchestrator/guardrails.py`), не только
-  в тексте промпта: anti-hallucination на выбор варианта, source-of-truth
-  проверка policy/approval, идемпотентность CreateOrder/CancelOrder.
-- Явная таблица разрешённых переходов состояний (`orchestrator/transitions.py`)
-  — LLM не может "перепрыгнуть" через policy_check к order_creating.
-- `SearchResultSnapshot` — единый формат результата поиска для ЛЮБОГО домена
-  (рейсы/отели/жд), поэтому select_option/check_policy/create_order
-  переиспользуются без изменений между доменами (ключевая находка шага 3).
+```
+Пользователь
+    │
+    ▼
+POST /sessions/{id}/message  (сырой текст)
+    │
+    ▼
+NLUService (nlu/service.py) ──── Gemini (gemini-3.6-flash)
+    │  intent + entities, либо clarification_needed
+    ▼
+orchestrator/router.py:route()  — типизация слотов по intent'у
+    │
+    ▼
+orchestrator/graph.py  (LangGraph StateGraph)
+    │  search → select_option → check_policy → interrupt() → create_order
+    ▼
+orchestrator/core.py:Orchestrator  — вся бизнес-логика и guardrails
+    │
+    ▼
+tools/*  — клиенты внешних/внутренних систем (сейчас — заглушки)
+```
 
-## Статус реализации: сделано (8 коммитов, 46/46 тестов)
+Персистентность: `langgraph.checkpoint.sqlite.aio.AsyncSqliteSaver`
+(файл `sessions.db`) — диалоги переживают перезапуск процесса.
+Проверено вживую: остановка `run_server.py`, повторный запуск,
+`GET /sessions/{id}/state` возвращает сохранённое состояние.
 
-| Intent | Orchestrator метод | Graph нода | Точка входа через router? | Реальный API |
-|---|---|---|---|---|
-| SearchFlight | ✅ `search_flights` | ✅ `search_flights` | ✅ | Kiwi.com MCP (`mcp.kiwi.com`, tool `search-flight`, без ключа) |
-| SearchHotel | ✅ `search_hotels` | ✅ `search_hotels` | ✅ | trivago MCP (`mcp.trivago.com/mcp`, tool `search_hotels`, без ключа) |
-| SearchTrain | ✅ `search_trains` | ✅ `search_trains` | ✅ | честная заглушка `FakeTrainClient` — публичного no-key API с ценой/местами не нашлось (DB — только расписания без цен и с ключом, SNCF — свой ключ, 12306 — не тот рынок) |
-| SelectOption | ✅ `select_option` | ✅ `select_option` | ✅ (как ВТОРОЙ ход после SearchX в том же session_id) | anti-hallucination guardrail |
-| CheckPolicyCompliance | ✅ `check_policy` | ✅ `check_policy` | — (внутренний шаг потока, не отдельный intent входа) | заглушка (internal API) |
-| RequestApproval/CreateOrder | ✅ `create_order` | ✅ `create_order` + `await_user_confirmation` (interrupt) | — (только через `/confirm`, resume уже начатого потока) | заглушка (internal API) |
-| CheckOrderStatus | ✅ `check_order_status` | ✅ `check_order_status` | ✅ (самостоятельный короткий путь, сразу в END) | заглушка (internal API) |
-| CancelOrder | ✅ `cancel_order` | ✅ `cancel_order` | ✅ (самостоятельный короткий путь, сразу в END) | заглушка (internal API) |
-| ExplainPolicy/SmallTalk/OutOfScope | ❌ не начато | ❌ | `router.route()` бросает `UnsupportedIntentError` → HTTP 501 | — |
+---
 
-**Шаг 5 (router + FastAPI) сделан:** `orchestrator/router.py` — маппинг
-`intent + сырые слоты` → `(entry_node, типизированные graph_params)`, с
-явной таблицей на каждый intent (например, слот `destination` для
-`SearchFlight` и `SearchHotel` — РАЗНЫЕ поля `GraphState`, `destination`
-vs `hotel_city` — намеренно не смешаны). `orchestrator/graph.py` теперь
-ветвится от `START` по `state["intent_entry_node"]`
-(`route_from_graph_state`), а не идёт одним жёстким путём.
-`api/main.py` — тонкая FastAPI-обёртка (3 эндпоинта: `POST .../intent`,
-`POST .../confirm`, `GET .../state`), `thread_id` = `session_id`,
-персистентность между ходами — через `MemorySaver` графа (см.
-`tests/test_api.py` — доказывает end-to-end HTTP-путь на фейковых
-клиентах, включая продолжение SearchFlight → SelectOption → confirm в
-ОДНОЙ HTTP-сессии).
+## Что реализовано
 
-## Известные технические особенности (не баги, осознанные решения)
+### Ядро оркестратора (`orchestrator/core.py`, `orchestrator/guardrails.py`)
+- Intent'ы: `SearchFlight`, `SearchHotel`, `SearchTrain`, `SelectOption`,
+  `CheckOrderStatus`, `CancelOrder`, `CreateOrder`
+- Guardrails: idempotency (повторный `create_order` с тем же ключом не
+  дублирует заказ), policy-check перед подтверждением, запрет
+  пропускать шаги state machine (нельзя из `idle` сразу в
+  `order_confirmed` и т.п.)
+- `DialogueState.active_intent` — подсказка активного intent'а,
+  выставляется в начале каждого intent-метода и сбрасывается на
+  успешных терминальных переходах (`order_confirmed`, `cancelled`,
+  `idle` после `CheckOrderStatus`) — **не** сбрасывается на
+  `*_failed`, чтобы подсказка осталась актуальной при повторной попытке
 
-- `tools/internal_api_client.py` — все 6 внутренних методов (профиль,
-  политика, approval, заказы) представляют собой честные заглушки с
-  `# TODO(internal-api):` — реальных эндпоинтов компании у нас нет и не
-  может быть без доступа к их системам.
-- `tools/kiwi_client.py` и `tools/trivago_client.py` — код написан по
-  официальной документации, но НЕ протестирован вживую в моей (Claude)
-  песочнице: сеть там ограничена белым списком доменов. В вашем Codespace
-  сеть полная — Kiwi мы уже проверили вживую (работает, см. историю).
-  Trivago — ещё не проверяли живьём, только код написан.
-- Был найден и исправлен реальный дублирующийся метод `cancel_order` в
-  `core.py` (два идентичных определения, тесты не ловили, т.к. оба работали
-  одинаково) — хороший пример, что зелёные тесты ≠ отсутствие мёртвого кода.
-- Было заражение кода автопереводом браузера Chrome (`graph` → `Графин`) —
-  ОБЯЗАТЕЛЬНО держите автоперевод страницы отключённым для github.dev/
-  vscode.dev, иначе редактор может незаметно испортить идентификаторы прямо
-  во время просмотра файла.
-- **Найден и исправлен реальный баг в `route_after_search` (шаг 5).**
-  Изначально (унаследовано от старого одного жёсткого пути) эта функция
-  сразу вела в ноду `select_option` после успешного поиска — работало
-  только потому, что старый `demo_graph_run.py` передавал `option_id`
-  заранее одним вызовом. По HTTP это ломалось незаметно: ручной прогон
-  через `TestClient` показал, что `POST /intent {SearchFlight}` возвращал
-  `200` вместе с полем `error: "option_id не указан"`, потому что граф
-  в рамках ОДНОГО `graph.ainvoke()` пытался тут же выбрать вариант,
-  которого пользователь физически ещё не мог назвать. Исправлено:
-  `route_after_search` теперь всегда `END` после показа результатов —
-  `SearchX` и `SelectOption` строго два разных хода диалога, как и было
-  задумано в Intent Map. Заодно пришлось перевести `demo_graph_run.py`
-  с одного вызова на три (`search → select → confirm`), чтобы демо
-  честно отражало реальный HTTP-путь, а не маскировало его.
+### Граф (`orchestrator/graph.py`)
+- Точка входа в граф — параметр `intent_entry_node`, а не жёсткий путь
+  (переключение произошло на шаге 5)
+- `route_after_search`: после показа результатов поиска граф
+  **останавливается** (END) и ждёт отдельный ход `SelectOption` — это
+  было исправлено (раньше граф пытался сразу выбрать вариант в одном
+  вызове с поиском, что при реальном HTTP-использовании приводило к
+  ложной ошибке `option_id не указан` на каждый успешный поиск)
+- `build_graph(orchestrator, checkpointer=None)` — checkpointer
+  передаётся снаружи (по умолчанию `MemorySaver`, для тестов и обычной
+  разработки; `AsyncSqliteSaver` — для персистентного запуска)
 
-## Оставшийся план (по порядку, как договаривались "всё по порядку")
+### FastAPI (`api/main.py`)
+- `POST /sessions/{id}/intent` — вход с уже готовым `intent` + `slots`
+  (для ручных/скриптовых вызовов, минуя NLU)
+- `POST /sessions/{id}/message` — вход с сырым текстом, сам вызывает
+  NLU-слой; если `clarification_needed` — граф не трогается, сразу
+  возвращается уточняющий вопрос
+- `POST /sessions/{id}/confirm` — подтверждение/отказ на `interrupt()`
+- `GET /sessions/{id}/state` — снимок состояния сессии
+- `TurnResponse.message` — человекочитаемый текст результата поиска.
+  **Красиво отформатирован только для `SearchFlight`** (маршрут, даты,
+  цены, ID вариантов, подсказка "выбираю <ID>"); для `SearchHotel`/
+  `SearchTrain` — безопасный общий текст с количеством вариантов без
+  предположений о структуре полей (во избежание падений на
+  несовпадении схемы данных между доменами)
+- `create_app(orchestrator=None, nlu_service=None, graph=None)` — все
+  три зависимости внедряются DI-паттерном, как и везде в проекте
 
-1. ~~CheckOrderStatus~~ ✅
-2. ~~CancelOrder~~ ✅
-3. ~~SearchHotel~~ ✅
-4. ~~SearchTrain~~ ✅
-5. ~~FastAPI-обёртка + intent-роутер~~ ✅
-6. ~~Известные упрощения шага 5 / NLU-слой~~ ✅ — реализовано как
-   `nlu/service.py` (`NLUService`, DI-паттерн как у `Orchestrator`) +
-   новый эндпоинт `POST /sessions/{id}/message` (сырой текст →
-   `NLUService.extract()` → либо `clarification` в ответе без захода в
-   граф, либо `NLUExtraction.entities` напрямую в уже существующий
-   `orchestrator/router.py:route()` — конвертация не нужна, тип тот же
-   `list[ExtractedEntity]`). `/intent` остался нетронутым для
-   ручных/скриптовых вызовов. Общее тело обоих эндпоинтов вынесено в
-   `_run_intent_turn()` (см. `api/main.py`).
+### NLU (`nlu/service.py`)
+- `NLUService` — обёртка над `ChatGoogleGenerativeAI(...).with_structured_output(NLUExtraction)`
+- **Провайдер — Google Gemini** (`gemini-3.6-flash`), не Anthropic.
+  Причина смены: изначально был Anthropic Claude, но проект осознанно
+  переведён на Gemini. `provider="anthropic"` оставлен в коде как
+  опция, если понадобится сравнить модели
+- LLM подставляется через DI — тесты используют `FakeStructuredLLM`,
+  реальный вызов API не требуется для прогона тестов
+- Промпт (`SYSTEM_PROMPT`) собирает список допустимых intent'ов и
+  слотов **прямо из `router.py:INTENT_SPECS`** — не может рассинхронизироваться
+  с реальной логикой роутера
+- Живьём проверено на реальных репликах через Gemini API — извлечение
+  intent/entities работает корректно для полных и неполных запросов
 
-   **LLM-провайдер сменён с Anthropic Claude на Google Gemini**
-   (`ChatGoogleGenerativeAI(...).with_structured_output(NLUExtraction)`,
-   модель по умолчанию `gemini-2.5-flash`) — `NLUService(provider=...)`
-   поддерживает оба ("google" по умолчанию, "anthropic" оставлен как
-   опция). Важное отличие, из-за которого чуть не сломался запуск:
-   в отличие от `ChatAnthropic`, конструктор `ChatGoogleGenerativeAI`
-   **проверяет наличие ключа сразу**, а не при первом вызове — поэтому
-   ленивая инициализация `NLUService` в `api/main.py` (строится только
-   при первом обращении к `/message`, не при старте приложения) здесь
-   не опциональное удобство, а обязательное условие, иначе
-   `uvicorn api.main:app` не поднимался бы вовсе без `GOOGLE_API_KEY`.
+### Данные о рейсах (`tools/flight_api_adapter.py`)
+- **`kiwi_client.py` удалён.** Причина: у Kiwi нет открытой регистрации
+  для новых пользователей — реальная интеграция технически была почти
+  готова (баг с распаковкой кортежа `streamable_http_client` был найден
+  и исправлен), но стала недостижима из-за закрытой регистрации
+- `FlightApiAdapter` — локальный детерминированный генератор данных
+  (`provider_name = "mvp-local"`), без сети и ключей. Цены
+  детерминированы по паре origin/destination — одинаковый запрос даёт
+  одинаковый результат
+- Параметр в `Orchestrator.__init__` называется `flight_client`
+  (переименовано из `kiwi_client`, чтобы имя не вводило в заблуждение)
 
-   Попутно найден и исправлен реальный баг: `DialogueState.active_intent`
-   был объявлен в `state.py`, но НИКОГДА не устанавливался ни в одном
-   методе `Orchestrator` — подсказка активного intent'а для NLU (нужна
-   для anaphora/"туда же", "на те же даты") была бы no-op. Исправлено:
-   `active_intent` теперь выставляется в начале `search_flights` /
-   `search_hotels` / `search_trains` / `check_order_status` /
-   `cancel_order` и сбрасывается в `None` на успешных терминальных
-   переходах (`order_confirmed`, `cancelled`, `idle` после
-   `CheckOrderStatus`) — но НЕ на `order_failed`/`cancel_failed`,
-   намеренно: пользователь может захотеть повторить попытку, и подсказка
-   там ещё уместна.
+### Персистентность (`run_server.py`)
+- `python3 run_server.py` — запуск с `AsyncSqliteSaver` (файл
+  `sessions.db`, путь настраивается через `SESSIONS_DB_PATH`)
+- Обычный `uvicorn api.main:app --reload` по-прежнему работает и даёт
+  in-memory поведение (для быстрой разработки с hot-reload)
+- **Ограничение:** `run_server.py` не поддерживает `--reload`
+  (программный запуск `uvicorn.Server` этого не даёт) — для разработки
+  использовать обычный `uvicorn --reload`, `run_server.py` — только
+  для проверки/использования персистентности
 
-   Тесты: `tests/test_nlu_service.py` (юнит, `FakeStructuredLLM`, без
-   реального Anthropic API) + `tests/test_api.py` (`/message`
-   end-to-end через тот же `FakeStructuredLLM`, включая проверку, что
-   `active_intent` реально доезжает до NLU через HTTP на втором ходу
-   одной и той же сессии).
+---
 
-7. **Известные упрощения шага 6, которые стоит закрыть дальше:**
-   - `NLUService.extract()` принимает `history` явным списком сообщений,
-     но НИКТО пока не собирает эту историю из `DialogueState`/checkpointer'а
-     и не передаёт её в `/message` — сейчас anaphora-контекст ограничен
-     только `active_intent` (одна строка), полной истории реплик пока нет.
-   - Промпт (`nlu/service.py:SYSTEM_PROMPT`) не протестирован на реальных
-     ответах LLM — только структура вызова (через `FakeStructuredLLM`).
-     Качество извлечения intent/entities на живых репликах нужно
-     проверить вручную с реальным `GOOGLE_API_KEY` (в моей песочнице
-     ключа нет; сеть на `generativelanguage.googleapis.com` в моём
-     network_configuration НЕ разрешена — я физически не могу сам
-     сделать живой вызов, только пользователь в своём Codespace).
-   - `intent_switch_detected` и `alternative_intents` из `NLUExtraction`
-     сейчас никак не используются в `api/main.py` — они долетают до
-     `NLUOutput`, но `_run_intent_turn` их просто игнорирует.
-   - Нет эндпоинта "явно прервать/отменить ожидающий interrupt" — если
-     `POST /confirm` не пришёл, сессия так и висит в
-     `approval_pending`/паузе (не баг, а нереализованная часть; сейчас
-     `POST .../intent` в этом состоянии просто вернёт 409).
-   - `MemorySaver` — состояние диалога живёт только в памяти процесса
-     (см. также пункт про Redis/Postgres в README.md) — под нагрузкой/
-     рестарт процесса потеряет все сессии.
+## Тесты
 
-## Как продолжить technически
+```bash
+PYTHONPATH=. pytest tests/ -v
+```
+58 тестов, все зелёные: ядро оркестратора, guardrails, роутер, граф
+через HTTP (`test_api.py`), NLU-слой (`test_nlu_service.py`,
+`FakeStructuredLLM`, без реальных вызовов API).
 
-Рабочий процесс, который сложился и хорошо работает:
-1. Claude пишет код у себя в песочнице, сразу гоняет `pytest` — показывает
-   реальный проходящий вывод, а не просто код.
-2. Собирает **патч-архив** только с изменёнными файлами (не весь проект
-   каждый раз) — экономит время на перенос.
-3. Даёт команды `unzip -o patch.zip -d /tmp/patchN` + `cp` — НЕ heredoc
-   через терминал (несколько раз обрывался при длинной вставке) и НЕ прямая
-   правка в редакторе (риск порчи автопереводом браузера).
-4. Пользователь применяет патч в Codespace, гоняет тесты, коммитит и
-   пушит на GitHub с содержательным сообщением коммита.
+---
 
-## Рабочее окружение
+## Как запустить
 
-- GitHub Codespaces, репозиторий `NamesEgorka/-AI--001`, ветка `master`.
-- Зависимости: `pydantic`, `httpx`, `mcp`, `pytest`, `pytest-asyncio`,
-  `langgraph`, `fastapi`, `uvicorn`, `langchain-google-genai` (все уже в
-  `requirements.txt`).
-- Для реального (не через FakeStructuredLLM) вызова `/message` нужен
-  `GOOGLE_API_KEY` (или `GEMINI_API_KEY`) в окружении Codespace — без
-  него `NLUService()` по умолчанию упадёт при первом обращении к
-  `/message` (но НЕ при старте приложения — см. ленивую инициализацию
-  в `api/main.py:create_app`; см. также важное отличие от
-  `ChatAnthropic` в docstring `nlu/service.py`).
-- Запуск тестов: `PYTHONPATH=. pytest tests/ -v`
-- Запуск демо графа: `PYTHONPATH=. python3 demo_graph_run.py`
+```bash
+pip install -r requirements.txt
+```
+
+Ключ Gemini — через GitHub Codespaces Secrets (`GOOGLE_API_KEY`) или
+`export GOOGLE_API_KEY="..."` в том же терминале, где будет запускаться
+сервер (переменные окружения не передаются между вкладками терминала).
+
+```bash
+# Разработка, hot-reload, in-memory (сессии сотрутся при рестарте)
+uvicorn api.main:app --reload
+
+# Персистентный запуск (сессии переживают рестарт, sessions.db)
+python3 run_server.py
+```
+
+**Важно:** порт 8000 в Codespaces по умолчанию публичный — держите его
+**Private** во вкладке "Порты" (иначе в логи будет постоянно сыпаться
+шум от автоматических сканеров интернета — не баг, но раздражает и
+небезопасно для чего угодно ценнее тестового MVP).
+
+---
+
+## Осознанные ограничения (НЕ делаем сейчас — это тестовый проект)
+
+Явное решение: пока используется как тестовый/портфолио-бот, не для
+реальной работы, следующее НЕ подключается:
+
+1. **Реальные внутренние API компании** — профиль пользователя,
+   тревел-политика, согласование, создание/статус/отмена заказа. Все
+   пять — заглушка `InternalApiClient`
+2. **Реальный внешний flight-провайдер** — нет доступного поставщика с
+   открытой регистрацией на момент разработки; `FlightApiAdapter`
+   остаётся локальным
+3. **Postgres/Redis** — SQLite выбран как достаточный для этого
+   масштаба, не требует поднимать отдельный сервис
+
+---
+
+## Известные технические ограничения (можно закрыть дальше, не блокеры)
+
+- NLU не получает полную историю реплик диалога — только
+  `active_intent` (одна строка-подсказка). Anaphora resolution
+  ("туда же", "на те же даты") работает хуже, чем могла бы с полной
+  историей
+- `intent_switch_detected` и `alternative_intents` из `NLUExtraction`
+  долетают до `NLUOutput`, но нигде не используются в `/message`
+- `message`/`options` формат красив только для `SearchFlight` —
+  `SearchHotel`/`SearchTrain` получают общий безопасный, но не
+  "красивый" текст
+- Chrome автоперевод страницы **обязательно держать выключенным** для
+  `github.dev`/`vscode.dev` — ранее уже был случай порчи идентификаторов
+  в коде через автоперевод браузера при простом просмотре файла
+
+---
+
+## История ключевых решений (кратко)
+
+1. Ядро оркестратора + guardrails + 4 intent'а с честными
+   заглушками/реальными MCP-клиентами, 24 теста
+2. FastAPI-обёртка + intent-роутер поверх графа; найден и исправлен
+   баг двухходового поиска (`route_after_search`)
+3. NLU-слой (`NLUService` + `POST /message`); найден и исправлен баг
+   с никогда не устанавливаемым `active_intent`
+4. Провайдер LLM: Anthropic Claude → Google Gemini
+   (`gemini-3.6-flash`)
+5. `kiwi_client.py` удалён (нет регистрации для новых пользователей) →
+   `FlightApiAdapter` (локальный MVP-провайдер); добавлен
+   человекочитаемый `message`/`options` в ответах API
+6. Персистентность: `MemorySaver` → `AsyncSqliteSaver`
+   (`run_server.py`), проверено вживую переживание рестарта процесса
